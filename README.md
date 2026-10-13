@@ -1,9 +1,19 @@
 # SSH Workbench
 
-SSH Workbench is a standalone desktop terminal and remote file explorer. It
-connects directly to a machine over SSH, using SFTP where the host offers it and
-falling back to a shell and `scp` where it does not; the remote machine does not
-need a web UI, agent, daemon, or any software beyond its normal SSH service.
+SSH Workbench puts a file explorer, a text editor, and a terminal on the same
+screen — all over **one SSH connection**, with drag-and-drop moving files
+between them. Instead of juggling a browser tab, a separate file-transfer tool,
+and a shell window, everything you need to work on a remote machine sits in one
+app: you drop a file into a folder, edit it in place, and watch it land — without
+ever leaving the connection.
+
+It connects directly over SSH, using SFTP where the host offers it and falling
+back to a shell and `scp` where it does not; the remote machine needs nothing
+beyond its normal SSH service.
+
+> **Vibe-coded.** This was built with an AI coding assistant. It works, and it's
+> been through a real test suite — but treat it like a tool you inspect before you
+> hand it credentials, and send fixes or ideas as issues.
 
 The interface combines:
 
