@@ -1,0 +1,62 @@
+{
+  "name": "ssh-workbench",
+  "version": "0.11.10",
+  "description": "Standalone SSH terminal and SFTP file explorer",
+  "main": "main.js",
+  "author": "SSH Workbench contributors",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "npm run build && electron .",
+    "test": "node --test test/*.test.js",
+    "check": "npm run build && npm test",
+    "dist": "npm run build && electron-builder",
+    "dist:win": "npm run build && electron-builder --win portable",
+    "pack:win": "npm run build && electron-builder --win dir",
+    "e2e": "node test/e2e/multi-session.mjs && node test/e2e/takeover.mjs && node test/e2e/reconnect.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "electron": "^43.4.0",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.9"
+  },
+  "build": {
+    "appId": "local.sshworkbench.app",
+    "productName": "SSH Workbench",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/*.map",
+      "lib/**/*",
+      "src/index.html",
+      "src/styles.css",
+      "main.js",
+      "preload.js",
+      "package.json",
+      "build/icon.png",
+      "!node_modules/cpu-features/**/*",
+      "!node_modules/ssh2/lib/protocol/crypto/build/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "portable"
+      ]
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "target": [
+        "AppImage"
+      ]
+    }
+  }
+}

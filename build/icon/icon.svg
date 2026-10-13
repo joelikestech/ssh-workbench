@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- SSH Workbench: the window in miniature. Files on the left, the shell on the right. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2533"/><stop offset="1" stop-color="#0e1116"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#tile)"/>
+  <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#33405a" stroke-width="2"/>
+  <rect x="100" y="48" width="8" height="160" rx="4" fill="#2c3648"/>
+  <rect x="44" y="64" width="34" height="24" rx="6" fill="#4c8dff"/>
+  <rect x="44" y="116" width="34" height="24" rx="6" fill="#4c8dff" fill-opacity=".7"/>
+  <rect x="44" y="168" width="34" height="24" rx="6" fill="#4c8dff" fill-opacity=".45"/>
+  <path d="M134 100l34 28-34 28" fill="none" stroke="#e7ebf2" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="176" y="150" width="40" height="16" rx="4" fill="#55c271"/>
+</svg>

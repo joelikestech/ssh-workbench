@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="../dist/renderer.css">
+</head>
+<body>
+  <section id="connect-view" class="connect-view">
+    <form id="connect-form" class="connect-card">
+      <header class="connect-head">
+        <!-- The application icon itself (build/icon/icon.svg), so the two cannot drift apart. -->
+        <svg class="brand-mark" viewBox="16 16 224 224" aria-hidden="true">
+          <defs>
+            <linearGradient id="brand-tile" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#1d2533"/><stop offset="1" stop-color="#0e1116"/>
+            </linearGradient>
+          </defs>
+          <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#brand-tile)"/>
+          <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#33405a" stroke-width="2"/>
+          <rect x="100" y="48" width="8" height="160" rx="4" fill="#2c3648"/>
+          <rect x="44" y="64" width="34" height="24" rx="6" fill="#4c8dff"/>
+          <rect x="44" y="116" width="34" height="24" rx="6" fill="#4c8dff" fill-opacity=".7"/>
+          <rect x="44" y="168" width="34" height="24" rx="6" fill="#4c8dff" fill-opacity=".45"/>
+          <path d="M134 100l34 28-34 28" fill="none" stroke="#e7ebf2" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="176" y="150" width="40" height="16" rx="4" fill="#55c271"/>
+        </svg>
+        <h1>SSH Workbench</h1>
+        <span id="app-version" class="app-version" title="Which build this is"></span>
+      </header>
+      <section class="profile-panel" aria-label="Saved connections">
+        <div class="profile-load-row">
+          <label>Saved connection
+            <select id="saved-profile"><option value="">New connection…</option></select>
+          </label>
+          <button id="quick-connect" class="primary" type="button" disabled title="Connect to this saved connection (Enter)">Connect</button>
+          <button id="delete-profile" class="danger" type="button" disabled>Delete</button>
+        </div>
+        <div class="profile-save-row">
+          <label>Name<input id="profile-name" maxlength="80" placeholder="Production server"></label>
+          <button id="save-profile" type="button">Save connection</button>
+        </div>
+        <div class="credential-row">
+          <label class="credential-toggle"><input id="save-credentials" type="checkbox" checked> Save passwords and key passphrases</label>
+          <span class="master-actions">
+            <button id="master-lock" type="button" class="hidden" title="Lock saved credentials now (Ctrl+Shift+L)">Lock now</button>
+            <button id="master-manage" type="button">Master password…</button>
+          </span>
+        </div>
+        <small id="credential-storage" class="credential-storage"></small>
+        <small id="master-state" class="credential-storage"></small>
+      </section>
+      <div class="field-row">
+        <label>Host<input id="host" required autocomplete="url" placeholder="server.example.com"></label>
+        <label>Port<input id="port" required type="number" min="1" max="65535" value="22"></label>
+      </div>
+      <div class="field-pair">
+        <label>Username<input id="username" required autocomplete="username"></label>
+        <label>Authentication
+          <select id="auth-type">
+            <option value="password" selected>Password</option>
+            <option value="key">Private key</option>
+            <option value="agent">SSH agent</option>
+          </select>
+        </label>
+      </div>
+      <div id="key-fields" class="auth-fields field-pair hidden">
+        <label>Private key
+          <span class="input-button"><input id="key-path" readonly><button id="choose-key" type="button">Browse…</button></span>
+        </label>
+        <label>Passphrase<input id="passphrase" type="password" autocomplete="current-password"></label>
+      </div>
+      <div id="password-fields" class="auth-fields">
+        <label>Password<input id="password" type="password" autocomplete="current-password"></label>
+      </div>
+      <label class="jump-toggle"><input id="jump-enabled" type="checkbox"> Connect through a jump host (ProxyJump)</label>
+      <section id="jump-fields" class="jump-fields hidden">
+        <div class="field-row">
+          <label>Host<input id="jump-host" autocomplete="url" placeholder="bastion.example.com"></label>
+          <label>Port<input id="jump-port" type="number" min="1" max="65535" value="22"></label>
+        </div>
+        <div class="field-pair">
+          <label>Username<input id="jump-username" autocomplete="username"></label>
+          <label>Authentication
+            <select id="jump-auth-type">
+              <option value="password">Password</option>
+              <option value="key">Private key</option>
+              <option value="agent" selected>SSH agent</option>
+            </select>
+          </label>
+        </div>
+        <div id="jump-key-fields" class="auth-fields field-pair hidden">
+          <label>Private key
+            <span class="input-button"><input id="jump-key-path" readonly><button id="choose-jump-key" type="button">Browse…</button></span>
+          </label>
+          <label>Passphrase<input id="jump-passphrase" type="password" autocomplete="current-password"></label>
+        </div>
+        <div id="jump-password-fields" class="auth-fields hidden">
+          <label>Password<input id="jump-password" type="password" autocomplete="current-password"></label>
+        </div>
+      </section>
+      <div class="field-pair">
+        <label>File transfer
+          <select id="protocol">
+            <option value="sftp-scp">SFTP, fall back to SCP</option>
+            <option value="sftp">SFTP only</option>
+            <option value="scp">SCP only (shell)</option>
+          </select>
+        </label>
+        <label>Starting folder<input id="start-path" value="~" placeholder="~"></label>
+      </div>
+      <small id="protocol-note" class="credential-storage"></small>
+      <div class="connect-actions">
+        <button id="cancel-connect" class="hidden" type="button">Back to sessions</button>
+        <button class="primary connect-button" type="submit">Connect</button>
+      </div>
+      <div id="connect-message" class="form-message" role="status"></div>
+    </form>
+  </section>
+
+  <main id="workspace" class="workspace hidden">
+    <header class="appbar">
+      <nav id="tabstrip" class="tabstrip" role="tablist" aria-label="Session tabs"></nav>
+      <button id="new-session" class="tab-add" title="New session (Ctrl+Shift+T)" aria-label="New session">＋</button>
+      <button id="new-window" class="tab-add" title="New window (Ctrl+Shift+N)" aria-label="New window">⧉</button>
+      <span class="spacer"></span>
+      <span id="connection-label" class="connection-label"></span>
+      <button id="reconnect" class="hidden" title="Reconnect this session">Reconnect</button>
+      <button id="disconnect" class="danger" title="Disconnect and close this session (Ctrl+Shift+W)">Disconnect</button>
+    </header>
+    <section id="split" class="split">
+      <section id="files-pane" class="pane files-pane" title="Drop local files or folders here to upload">
+        <div class="toolbar">
+          <button id="up" title="Parent folder">↑ Up</button>
+          <button id="home">Home</button>
+          <button id="refresh" title="Refresh (F5)" aria-label="Refresh"><span class="refresh-glyph">⟳</span></button>
+          <div class="search-tools">
+            <input id="search" type="search" placeholder="Search names, or paths with /"
+              title="report — name contains it&#10;logs/report — path below this folder contains it&#10;/var/log/rep — whole remote path contains it&#10;*.log or report-?.txt — wildcard pattern"
+              aria-label="Search file and folder names or paths">
+            <button id="clear-search" title="Clear search" disabled>×</button>
+            <select id="search-scope" aria-label="Search scope">
+              <option value="recursive">Subfolders</option>
+              <option value="current">Current folder</option>
+            </select>
+          </div>
+          <span class="spacer"></span>
+          <button id="upload-files" class="primary">Upload files</button>
+          <button id="upload-folder">Upload folder</button>
+          <button id="new-folder">New folder</button>
+          <button id="rename" disabled>Rename</button>
+          <button id="download" disabled>Download</button>
+          <button id="delete" class="danger" disabled>Delete</button>
+        </div>
+        <div class="path-bar">
+          <input id="path-input" class="path-input" type="text" spellcheck="false"
+            autocomplete="off" autocapitalize="off" aria-label="Remote path"
+            title="The folder shown. Select it to copy it, or type or paste a path and press Enter (Ctrl+L)"
+            placeholder="Type or paste a remote path, then press Enter">
+        </div>
+        <div id="file-scroll" class="file-scroll">
+          <table>
+            <thead><tr>
+              <th><input id="select-all" type="checkbox" aria-label="Select all"></th>
+              <th data-sort="name">Name</th>
+              <th data-sort="size">Size</th>
+              <th data-sort="modified">Modified</th>
+              <th data-sort="mode">Mode</th>
+            </tr></thead>
+            <tbody id="file-rows"></tbody>
+          </table>
+        </div>
+        <footer class="statusbar"><span id="file-message">Ready</span><span id="file-count"></span></footer>
+      </section>
+      <div id="gutter" class="gutter"></div>
+      <section class="pane terminal-pane">
+        <div class="terminal-toolbar">
+          <strong>Terminal</strong><span class="spacer"></span>
+          <button id="terminal-help">? Help</button>
+          <button id="restart-terminal">⟳ Restart</button>
+        </div>
+        <div id="terminals" class="terminals"></div>
+      </section>
+    </section>
+  </main>
+
+  <div id="row-menu" class="row-menu hidden" role="menu" aria-label="File actions"></div>
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <section id="modal" class="modal" role="dialog" aria-modal="true"></section>
+  </div>
+  <script src="../dist/renderer.js"></script>
+</body>
+</html>

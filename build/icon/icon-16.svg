@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- Drawn on the 16 px grid: two file rows instead of three, edges on whole pixels. -->
+  <rect x="0" y="0" width="16" height="16" rx="3.5" fill="#151b25"/>
+  <rect x="0.5" y="0.5" width="15" height="15" rx="3" fill="none" stroke="#3a4760"/>
+  <rect x="6" y="3" width="1" height="10" fill="#2f3a4e"/>
+  <rect x="2" y="4" width="3" height="2" fill="#4c8dff"/>
+  <rect x="2" y="9" width="3" height="2" fill="#4c8dff" fill-opacity=".65"/>
+  <path d="M8.5 5l3 3-3 3" fill="none" stroke="#e7ebf2" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="12" y="10" width="3" height="2" fill="#55c271"/>
+</svg>
