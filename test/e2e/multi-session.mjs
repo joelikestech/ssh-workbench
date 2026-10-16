@@ -528,16 +528,20 @@ async function main() {
     const bottom = last.getBoundingClientRect();
     return {
       startX: Math.round(top.left + 1), startY: Math.round(top.top + top.height / 2),
+      cellWidth: (() => {
+        const measure = document.querySelector("#terminals > div:not(.hidden) .xterm-char-measure-element");
+        return measure.getBoundingClientRect().width / measure.textContent.length;
+      })(),
       endX: Math.round(bottom.right - 4), endY: Math.round(bottom.top + bottom.height / 2),
     };
   `);
   // The movement is spread over several events: xterm follows a drag from its own
   // frame loop, and a press and release in one task select a single cell.
-  const dragBlock = async (modifiers) => {
-    await mouse("mousePressed", blockBox.startX, blockBox.startY, { modifiers });
+  const dragBlock = async (modifiers, startX = blockBox.startX) => {
+    await mouse("mousePressed", startX, blockBox.startY, { modifiers });
     for (const step of [1, 2, 3, 4]) {
       await mouse("mouseMoved",
-        Math.round(blockBox.startX + ((blockBox.endX - blockBox.startX) * step) / 4),
+        Math.round(startX + ((blockBox.endX - startX) * step) / 4),
         Math.round(blockBox.startY + ((blockBox.endY - blockBox.startY) * step) / 4), { modifiers });
       await new Promise((resolve) => setTimeout(resolve, 60));
     }
@@ -545,22 +549,47 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 300));
   };
 
+  const copyWith = async (modifiers) => {
+    for (const type of ["rawKeyDown", "keyUp"]) {
+      await session.send("Input.dispatchKeyEvent",
+        { type, modifiers, key: modifiers & 8 ? "C" : "c", code: "KeyC", windowsVirtualKeyCode: 67 });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  };
+
+  // Ctrl+C removes the indentation the block shares and keeps what is inside it.
   await setClipboard("untouched");
-  await dragBlock(8); // 8 = Shift
+  await dragBlock(0);
+  await copyWith(2); // 2 = Ctrl
   const copiedBlock = (await clipboard()).replace(/\r/g, "").split("\n")
     .map((line) => line.trimEnd()).filter((line) => line.length);
   assert.deepEqual(copiedBlock, ["hooks:", "  PreToolUse:", "    - matcher: Bash"],
+    `Ctrl+C must drop the shared indentation and keep the structure (clipboard held ${JSON.stringify(await clipboard())})`);
+  console.log("• Ctrl+C drops the indentation the block shared, keeping what is inside it");
+
+  await setClipboard("untouched");
+  await dragBlock(8); // 8 = Shift
+  const shiftBlock = (await clipboard()).replace(/\r/g, "").split("\n")
+    .map((line) => line.trimEnd()).filter((line) => line.length);
+  assert.deepEqual(shiftBlock, ["hooks:", "  PreToolUse:", "    - matcher: Bash"],
     `Shift+drag must drop the shared indentation and keep the structure (clipboard held ${JSON.stringify(await clipboard())})`);
   console.log("• Shift+drag drops the indentation the block shared, keeping what is inside it");
 
+  // The drag people actually make: from the first letter, not from the space
+  // before it. The first line arrives bare, and the rest must still lose the margin.
+  await setClipboard("untouched");
+  await dragBlock(8, Math.round(blockBox.startX - 1 + blockBox.cellWidth * 4.3));
+  const fromLetter = (await clipboard()).replace(/\r/g, "").split("\n")
+    .map((line) => line.trimEnd()).filter((line) => line.length);
+  assert.deepEqual(fromLetter, ["hooks:", "  PreToolUse:", "    - matcher: Bash"],
+    `a drag begun on the first letter must still drop the margin (clipboard held ${JSON.stringify(await clipboard())})`);
+  console.log("• a drag begun on the first letter still drops the margin");
+
   // The one way to copy exactly what is on screen, for when the whitespace is the point.
+
   await setClipboard("untouched");
   await dragBlock(0);
-  for (const type of ["rawKeyDown", "keyUp"]) {
-    await session.send("Input.dispatchKeyEvent",
-      { type, modifiers: 10, key: "C", code: "KeyC", windowsVirtualKeyCode: 67 });
-  }
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  await copyWith(10); // 10 = Ctrl+Shift
   const verbatim = await clipboard();
   assert.match(verbatim, /^ {4}hooks:/, `Ctrl+Shift+C must copy it verbatim (clipboard held ${JSON.stringify(verbatim)})`);
   console.log("• Ctrl+Shift+C still copies exactly what is on screen");
@@ -740,6 +769,31 @@ async function main() {
   assert.equal(server.mouseReports() - beforeShift, 0, "Shift must keep the drag away from the remote program");
   assert.match(await clipboard(), /test/, "Shift+drag still selects and copies while the mouse is grabbed");
   console.log(`• a remote program can grab the mouse (${grabbedReports} reports forwarded); Shift overrides it`);
+
+  // Shift pressed only after the drag has begun -- the press has already gone to the
+  // program. The drag is taken back: the program is told the button came up, and the
+  // text from the original press to the pointer is selected and copied.
+  {
+    await setClipboard("untouched");
+    const y = terminalBox.top + 14;
+    const reportsBeforeLate = server.mouseReports();
+    await mouse("mousePressed", terminalBox.left + 10, y);
+    await mouse("mouseMoved", terminalBox.left + 60, y);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await session.send("Input.dispatchKeyEvent",
+      { type: "rawKeyDown", modifiers: 8, key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16 });
+    await mouse("mouseMoved", terminalBox.left + 120, y, { modifiers: 8 });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await mouse("mouseReleased", terminalBox.left + 120, y, { modifiers: 8 });
+    await session.send("Input.dispatchKeyEvent",
+      { type: "keyUp", modifiers: 0, key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const reports = server.received().split("\u001b[M").slice(-(server.mouseReports() - reportsBeforeLate));
+    assert.ok(reports.length >= 2, `the program saw the press and a release (${reports.length} reports)`);
+    assert.equal(reports[reports.length - 1][0], "#", "the last thing the program saw is the button coming up");
+    assert.match(await clipboard(), /test/, "Shift pressed mid-drag still copies the text dragged across");
+    console.log(`• Shift pressed after the drag began takes it back from the program and copies (${reports.length} reports, ending in a release)`);
+  }
   server.setMouseReporting(false);
   await new Promise((resolve) => setTimeout(resolve, 300));
 
@@ -1336,9 +1390,17 @@ async function main() {
   assert.equal(masterSet.lockOffered, true, "an unlocked vault offers Lock now");
   console.log(`• a master password can be set ("${masterSet.state}")`);
 
-  // Save the connection again, this time with its password, then lock.
+  // Save the connection again, this time with its password, then lock. It is chosen
+  // in the list first: a fresh form saved under a name already taken is refused
+  // rather than quietly replacing the connection of that name.
   const savedWithCredentials = await evaluate(session, `
     const $ = (id) => document.getElementById(id);
+    const existing = [...$("saved-profile").options].find((option) => option.textContent.startsWith("Test target"));
+    if (existing) {
+      $("saved-profile").value = existing.value;
+      $("saved-profile").dispatchEvent(new Event("change"));
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
     $("host").value = ${JSON.stringify(server.host)};
     $("port").value = "${server.port}";
     $("username").value = ${JSON.stringify(server.username)};

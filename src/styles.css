@@ -102,6 +102,13 @@ td.size,td.modified,td.mode{text-align:right;color:var(--muted);font-size:11.5px
 .modal{width:min(920px,92vw);max-height:88vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:11px;box-shadow:0 30px 90px rgba(0,0,0,.5);overflow:hidden}
 .modal-header{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--border)}.modal-header h2{font-size:14px;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.modal-body{padding:14px;overflow:auto}.modal-footer{display:flex;justify-content:flex-end;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
 .modal textarea{width:100%;height:min(62vh,620px);padding:10px;resize:vertical;font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.modal input{width:100%;padding:8px}.modal img{display:block;max-width:100%;max-height:68vh;margin:auto}.modal p{white-space:pre-wrap}.help-grid{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px;align-items:baseline}.help-grid code{color:#c9d9ff;white-space:nowrap}
+/* Every dialog is a page inside the one frame; the ones waiting their turn are kept
+   in it, hidden, behind the one shown. */
+.modal-page{display:contents}.modal-page[hidden]{display:none}
+.modal-note{margin-right:auto;align-self:center;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px}
+/* A question the editor asks of its own, above the text rather than in a dialog that
+   would have to take the editor's place. */
+.editor-notice{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;padding:8px 10px;border:1px solid #6b5a2a;border-radius:6px;background:#2a2516}.editor-notice span{flex:1 1 240px}
 .conflict-view{display:grid;gap:10px}.conflict-view p{margin:0;color:#bac3d1;white-space:normal}
 .conflict-all{display:flex;align-items:center;justify-content:flex-end;gap:8px;color:var(--muted);font-size:11.5px}
 .conflict-list{display:grid;gap:6px;max-height:min(52vh,440px);overflow:auto;padding:2px;scrollbar-width:thin}

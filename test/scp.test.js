@@ -261,10 +261,10 @@ test("edits a text file: read, change, write back", async () => {
     const target = path.posix.join(remoteRoot, "config.ini");
     fs.writeFileSync(target, "mode=old\n");
 
-    assert.equal(await manager.readFile(target), "mode=old\n");
+    assert.equal((await manager.readFile(target)).text, "mode=old\n");
     await manager.writeFile(target, "mode=new\n");
     assert.equal(fs.readFileSync(target, "utf8"), "mode=new\n");
-    assert.equal(await manager.readFile(target), "mode=new\n");
+    assert.equal((await manager.readFile(target)).text, "mode=new\n");
   });
 });
 

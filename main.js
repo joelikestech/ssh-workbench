@@ -10,7 +10,7 @@ const { ProfileStore } = require("./lib/profile-store");
 const { SshManager } = require("./lib/ssh-manager");
 const { Vault, MIN_PASSWORD, DEFAULT_MINUTES } = require("./lib/vault");
 const { sameInstallation, installationPath, installedVersion } = require("./lib/installation");
-const { listCopies, otherInstallations } = require("./lib/running-copies");
+const { listCopies, otherInstallations, sameProcess } = require("./lib/running-copies");
 
 const MAX_WINDOWS = 8;
 const MAX_SESSIONS_PER_WINDOW = 8;
@@ -84,7 +84,10 @@ function sendToOwner(session, channel, payload) {
   windowOf(session)?.webContents.send(channel, payload);
 }
 
-async function confirmHost(window, { identity, role = "SSH host", fingerprint, previousFingerprint }) {
+// `signal` closes the dialog when the connection it is asking about has ended without
+// waiting for the answer -- the server gave up, or the tab was closed -- so nobody is
+// left deciding about a key for a connection that no longer exists.
+async function confirmHost(window, { identity, role = "SSH host", fingerprint, previousFingerprint, signal }) {
   const changed = Boolean(previousFingerprint);
   const detail = changed
     ? `The host key for ${identity} changed.\n\nSaved: ${previousFingerprint}\nReceived: ${fingerprint}\n\nThis can indicate a man-in-the-middle attack or a reinstalled server.`
@@ -98,7 +101,9 @@ async function confirmHost(window, { identity, role = "SSH host", fingerprint, p
     defaultId: 0,
     cancelId: 0,
     noLink: true,
+    ...(signal ? { signal } : {}),
   });
+  if (signal?.aborted) return { accept: false, remember: false };
   if (changed) return { accept: result.response === 1, remember: result.response === 1 };
   return { accept: result.response > 0, remember: result.response === 2 };
 }
@@ -129,6 +134,7 @@ function createSession(window) {
   });
   session.manager.on("terminal-data", (data) => sendToOwner(session, "terminal:data", { id, data }));
   session.manager.on("terminal-exit", () => sendToOwner(session, "terminal:exit", { id }));
+  session.manager.on("browse-user", (state) => sendToOwner(session, "session:browse-user", { id, ...state }));
   session.manager.on("status", (status) => {
     if (!status.connected) resetSessionDragCache(session);
     sendToOwner(session, "session:status", { id, ...status });
@@ -222,7 +228,17 @@ function registerIpc() {
   handle("sessions:close", (window, id) => closeSession(requireSession(window, id).id));
 
   handle("profiles:list", () => profiles.list());
+  // Choosing a connection reads only what the form shows; its secrets come from
+  // profiles:secrets, which the window asks for at the moment of connecting and for
+  // nothing else. That second call is the one that counts as using a credential.
   handle("profiles:get", (_window, id) => profiles.get(id));
+  handle("profiles:secrets", (_window, id) => {
+    const answer = profiles.secrets(id);
+    // Using a credential moves a timed unlock along, or under "ask every time" ends
+    // it, and every window's idea of the vault has to move with it.
+    if (vault.configured) announceVault("used");
+    return answer;
+  });
   // Credentials that cannot be read can only be replaced, and replacing them is a
   // decision rather than a detail. The store refuses and says so; that refusal is
   // turned into an answer rather than an error, because an error crossing this
@@ -262,7 +278,7 @@ function registerIpc() {
       created.key.fill(0);
       throw error;
     }
-    return { ...vaultStatus(), ...result };
+    return { ...announceVault("set"), ...result };
   });
   handle("vault:change", async (_window, currentPassword, newPassword) => {
     const currentKey = await vault.keyFor(currentPassword);
@@ -273,7 +289,7 @@ function registerIpc() {
           oldKey: currentKey, newKey: created.key, config: created.config,
         });
         vault.adopt(created);
-        return { ...vaultStatus(), ...result };
+        return { ...announceVault("change"), ...result };
       } catch (error) {
         created.key.fill(0);
         throw error;
@@ -290,15 +306,15 @@ function registerIpc() {
     } finally {
       key.fill(0);
     }
-    return vaultStatus();
+    return announceVault("remove");
   });
   handle("vault:unlock", async (_window, password) => {
     await vault.unlock(password);
-    return vaultStatus();
+    return announceVault("unlock");
   });
   handle("vault:lock", () => {
     vault.lock();
-    return vaultStatus();
+    return announceVault("lock");
   });
   // Changing how often the password is needed is itself a security decision, so it
   // asks for the password rather than accepting whatever state the vault is in.
@@ -310,16 +326,39 @@ function registerIpc() {
     const proposed = vault.configFor(policy);
     profiles.saveVaultConfig(proposed);
     vault.adoptConfig(proposed);
-    return vaultStatus();
+    return announceVault("policy");
   });
 
   handle("files:list", (window, id, directory) => requireSession(window, id).manager.list(directory));
+  handle("files:follow-password", (window, id, password) =>
+    requireSession(window, id).manager.followWithPassword(password));
+  handle("files:decline-follow", (window, id) => requireSession(window, id).manager.declineFollow());
   handle("files:search", (window, id, directory, query, recursive) =>
     requireSession(window, id).manager.search(directory, query, recursive));
   handle("files:resolve", (window, id, remoteFile) => requireSession(window, id).manager.resolve(remoteFile));
-  handle("files:read", (window, id, remoteFile) => requireSession(window, id).manager.readFile(remoteFile));
+  // `{ text, eol, stamp }`: the stamp comes back with the save so a file changed
+  // on the host in the meantime is not silently overwritten.
+  handle("files:read", (window, id, remoteFile) => requireSession(window, id).manager.readFile(String(remoteFile ?? "")));
   handle("files:read-binary", (window, id, remoteFile) => requireSession(window, id).manager.readBinary(remoteFile));
-  handle("files:write", (window, id, remoteFile, contents) => requireSession(window, id).manager.writeFile(remoteFile, contents));
+  // The options come from the renderer, so they are checked here before anything is
+  // written: `eol` is one of the two line endings, and `expect` is a stamp made of
+  // two numbers. Anything else is refused rather than guessed at.
+  handle("files:write", (window, id, remoteFile, contents, options) => {
+    const given = options ?? {};
+    if (typeof given !== "object") throw new Error("The save options are not valid");
+    const eol = given.eol ?? "\n";
+    if (eol !== "\n" && eol !== "\r\n") throw new Error("The line ending to save with is not valid");
+    let expect = null;
+    if (given.expect !== undefined && given.expect !== null) {
+      const size = given.expect?.size;
+      const mtime = given.expect?.mtime;
+      if (!Number.isFinite(size) || size < 0 || !Number.isFinite(mtime)) {
+        throw new Error("The file stamp to save against is not valid");
+      }
+      expect = { size, mtime };
+    }
+    return requireSession(window, id).manager.writeFile(String(remoteFile ?? ""), String(contents ?? ""), { eol, expect });
+  });
   handle("files:mkdir", (window, id, directory, name) => requireSession(window, id).manager.mkdir(directory, name));
   handle("files:rename", (window, id, remoteFile, name) => requireSession(window, id).manager.rename(remoteFile, name));
   handle("files:delete", (window, id, paths) => requireSession(window, id).manager.delete(remoteSelection(paths)));
@@ -577,6 +616,41 @@ function vaultStatus() {
   };
 }
 
+// One process holds the vault, so a change made from one window -- locking it above
+// all -- is a change for every window, and each of them is told rather than left to
+// find out at its next question. A window that still believed the vault unlocked, or
+// unset, would go on offering what is no longer true: a shortcut that does nothing, a
+// form that looks ready to connect. The status goes to every window, the one that
+// asked included; `reason` says what happened, so a window can tell an explicit lock
+// from a timed unlock simply running out.
+let vaultExpiryTimer = null;
+
+function announceVault(reason) {
+  const status = vaultStatus();
+  for (const id of openWindows) {
+    const window = BrowserWindow.fromId(id);
+    if (window && !window.isDestroyed()) window.webContents.send("vault:changed", { ...status, reason });
+  }
+  scheduleVaultExpiry();
+  return status;
+}
+
+// A timed unlock ends on its own, and the windows are told when it does rather than
+// discovering it on the next connect. Every use moves the end along, so the timer is
+// re-read when it fires instead of trusted.
+function scheduleVaultExpiry() {
+  if (vaultExpiryTimer) clearTimeout(vaultExpiryTimer);
+  vaultExpiryTimer = null;
+  const remaining = vault?.expiresIn;
+  if (remaining === null || remaining === undefined) return;
+  vaultExpiryTimer = setTimeout(() => {
+    vaultExpiryTimer = null;
+    if (vault.unlocked) scheduleVaultExpiry();
+    else announceVault("expired");
+  }, Math.min(remaining + 250, 2 ** 31 - 1));
+  vaultExpiryTimer.unref?.();
+}
+
 // Closing a window takes its sessions with it: their connections are dropped and
 // their staged drag files removed, while other windows carry on untouched.
 async function closeWindowSessions(windowId) {
@@ -729,9 +803,15 @@ function stillRunning(pid) {
 // Closing another installation means closing every process it runs — the main
 // process, its renderers, its GPU process — and then waiting for the operating
 // system to agree that they are gone, because the lock is not free until they are.
+//
+// Every signal goes only to a process that is still the one that was listed. Ids are
+// reused, and the forced kill in particular is sent seconds after the listing: one
+// whose process has ended in the meantime may by then belong to something else
+// entirely, and is treated as gone instead.
 async function closeInstallation(group) {
+  const ours = (pid) => sameProcess(pid, group.started?.[pid]) && stillRunning(pid);
   const signal = (name) => {
-    for (const pid of group.pids.filter(stillRunning)) {
+    for (const pid of group.pids.filter(ours)) {
       try { process.kill(pid, name); } catch { /* it ended between the listing and here */ }
     }
   };
@@ -741,14 +821,14 @@ async function closeInstallation(group) {
   // both signals are the same call, so this only ever matters elsewhere.
   const insist = Date.now() + Math.round(TAKEOVER_WAIT_MILLISECONDS / 2);
   let insisted = false;
-  while (Date.now() < deadline && group.pids.some(stillRunning)) {
+  while (Date.now() < deadline && group.pids.some(ours)) {
     if (!insisted && Date.now() > insist) {
       signal("SIGKILL");
       insisted = true;
     }
     await new Promise((resolve) => setTimeout(resolve, 120));
   }
-  return !group.pids.some(stillRunning);
+  return !group.pids.some(ours);
 }
 
 // Launched while another copy holds the lock. The same installation means this is a

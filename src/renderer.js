@@ -1,7 +1,8 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import "@xterm/xterm/css/xterm.css";
-import { cleanCopy } from "../lib/terminal-copy.js";
+import { cleanCopy, cleanPaste } from "../lib/terminal-copy.js";
 import { pathEntry, pathForClipboard } from "../lib/path-entry.js";
 import {
   credentialsBoxChecked, credentialsControlEnabled, credentialsUnreadable, afterSave, fillSavedSecrets,
@@ -40,7 +41,15 @@ const TERMINAL_OPTIONS = {
   fontFamily: "Cascadia Mono, Consolas, ui-monospace, monospace",
   scrollback: 10000,
   theme: { background: "#101216", foreground: "#e7ebf2", cursor: "#cdd6e4", selectionBackground: "#31518e" },
+  // `terminal.unicode`, which the Unicode 11 widths below are switched on through, is
+  // still behind xterm's proposed-API flag.
+  allowProposedApi: true,
 };
+
+// Beyond these a click on the name downloads the file rather than opening it. The
+// image limit is the one the main process puts on reading a file for preview.
+const EDIT_LIMIT = 2 * 1024 * 1024;
+const PREVIEW_IMAGE_LIMIT = 20 * 1024 * 1024;
 
 function active() {
   return workbench.sessions.get(workbench.activeId) || null;
@@ -94,6 +103,9 @@ function fileStatus(text, error = false, ok = false) {
 
 /* -------------------------------------------------------------- clipboard */
 
+// Resolves to what the main process reported -- `{ truncated: true }` when the text
+// was longer than the clipboard channel carries and only its start was written -- or
+// to nothing when the browser's own clipboard had to be used instead.
 function copyToClipboard(text) {
   return api.clipboard.write(text).catch(() => navigator.clipboard?.writeText(text).catch(() => undefined));
 }
@@ -165,6 +177,14 @@ function newSession(id, connection, config, startPath, profileId = null) {
     host: null,
     opened: false,
     mouseSelection: false,
+    // Whether the selection was made with Alt+drag, which xterm makes a rectangle:
+    // every line of it starts at the same column, which changes what its shared
+    // indentation is.
+    columnSelection: false,
+    // A sudo password prompt raised while this tab was in the background, waiting
+    // for the tab to be shown rather than being answered "no" on the user's behalf.
+    pendingFollow: null,
+    followAsking: false,
     disposeWindowListeners: null,
   };
 }
@@ -173,25 +193,43 @@ function newSession(id, connection, config, startPath, profileId = null) {
 // a selection is a rectangle of screen and the depth it was printed at is not part
 // of what was copied. Ctrl+Shift+C is the one that does not, for the rare case where
 // the leading whitespace is the point.
+//
+// The status line is written once the copy has landed, because a copy longer than
+// the clipboard channel carries is cut short there, and saying "Copied" over half a
+// selection is worse than saying nothing: it is found out only when the paste comes
+// up short.
 function copySelection(session, { verbatim = false, announce = true } = {}) {
   if (!session.terminal.hasSelection()) return false;
   const selection = session.terminal.getSelection();
-  const text = verbatim ? selection : cleanCopy(selection);
-  copyToClipboard(text);
+  const startColumn = session.terminal.getSelectionPosition()?.start.x || 0;
+  const text = verbatim ? selection : cleanCopy(selection, { startColumn, column: session.columnSelection });
   session.terminal.clearSelection();
   session.mouseSelection = false;
-  if (announce) {
+  copyToClipboard(text).then((result) => {
+    if (result?.truncated) {
+      setMessage(session, `Copied only the first ${workbench.clipboardLimit.toLocaleString()} of ${text.length.toLocaleString()} characters; the clipboard will not take more at once.`, "error");
+      return;
+    }
+    if (!announce) return;
     setMessage(session, text === selection
       ? "Copied the selection."
       : "Copied the selection, without the indentation every line shared.", "ok");
-  }
+  });
   return true;
+}
+
+// Every way text reaches the shell as a paste comes through here -- right-click,
+// Ctrl+V, Ctrl+Shift+V, Shift+Insert, a middle-click on Linux -- so none of them can
+// carry a control character past it. What is taken out, and why, is in cleanPaste.
+function pasteText(session, text) {
+  const clean = cleanPaste(text);
+  if (clean) session.terminal.paste(clean);
 }
 
 function pasteFromClipboard(session) {
   readClipboard().then((text) => {
     if (text) {
-      session.terminal.paste(text);
+      pasteText(session, text);
       return;
     }
     // Nothing a shell can use, so an image on the clipboard goes to the folder.
@@ -220,6 +258,11 @@ function createTerminal(session) {
   const fit = new FitAddon();
   const terminal = new Terminal(TERMINAL_OPTIONS);
   terminal.loadAddon(fit);
+  // xterm counts an emoji as one cell by default (Unicode 6), while the host's
+  // wcwidth -- and so readline, zsh and vim -- counts two. Every emoji on a line then
+  // leaves the cursor one cell away from where the shell thinks it is.
+  terminal.loadAddon(new Unicode11Addon());
+  terminal.unicode.activeVersion = "11";
   terminal.onData((data) => api.terminal.input(session.id, data));
   // Mouse reports in the classic ESC [ M encoding arrive as raw bytes on a
   // separate channel; without this a program that grabs the mouse receives
@@ -233,6 +276,26 @@ function createTerminal(session) {
   // mouse selection can then be copied with Enter or the right button.
   let dragFromHost = false;
   let dragWithShift = false;
+  // A drag the remote program owns: where it was pressed, and where the pointer is.
+  let grabbedPress = null;
+  let pointer = null;
+  const synthetic = (type, at, { shiftKey = false, buttons = 1 } = {}) => {
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      button: 0,
+      buttons,
+      detail: 1,
+      shiftKey,
+      clientX: at.clientX,
+      clientY: at.clientY,
+      screenX: at.screenX,
+      screenY: at.screenY,
+    });
+    event.workbenchRestarted = true;
+    return event;
+  };
   // Capture phase on purpose: when a remote program has grabbed the mouse, xterm
   // cancels these events, and a bubble-phase listener would never run — which is
   // exactly the case where Shift+drag matters most.
@@ -242,6 +305,14 @@ function createTerminal(session) {
     if (event.workbenchRestarted) return;
     dragFromHost = true;
     dragWithShift = event.shiftKey;
+    // xterm makes an Alt+drag a column selection, and a double or triple click a
+    // word or a line whatever else is held.
+    session.columnSelection = event.altKey && event.detail <= 1;
+    const grabbed = session.terminal.modes?.mouseTrackingMode !== "none";
+    grabbedPress = grabbed && !event.shiftKey
+      ? { target: event.target, clientX: event.clientX, clientY: event.clientY, screenX: event.screenX, screenY: event.screenY }
+      : null;
+    pointer = grabbedPress;
     // xterm reads Shift+mousedown as "extend the selection", which is not what
     // Shift+drag means here. With nothing selected there is nothing to extend and the
     // drag selects nothing at all; with something selected it stretches that instead,
@@ -263,6 +334,8 @@ function createTerminal(session) {
         button: 0,
         buttons: event.buttons,
         detail: event.detail || 1,
+        // Alt is kept, so Shift+Alt+drag still selects a column.
+        altKey: event.altKey,
         clientX: event.clientX,
         clientY: event.clientY,
         screenX: event.screenX,
@@ -272,8 +345,35 @@ function createTerminal(session) {
       event.target.dispatchEvent(restart);
     }
   }, true);
+  // Shift pressed after the drag began, while a remote program -- Claude Code, vim,
+  // tmux -- holds the mouse. The press has already gone to the program, so there is
+  // no local selection for Shift to turn into a copy. The drag is taken back: the
+  // program is told the button came up where the pointer is now, so it is not left
+  // believing it is still held, and a local selection is started from the original
+  // press and stretched to the pointer, as if Shift had been down from the start. The
+  // program has still seen the click; that cannot be taken back.
+  const followPointer = (event) => {
+    if (grabbedPress && !event.workbenchRestarted) {
+      pointer = { clientX: event.clientX, clientY: event.clientY, screenX: event.screenX, screenY: event.screenY };
+    }
+  };
+  const takeDragBack = (event) => {
+    if (event.key !== "Shift" || !dragFromHost || !grabbedPress) return;
+    const press = grabbedPress;
+    grabbedPress = null;
+    dragWithShift = true;
+    const at = pointer || press;
+    document.dispatchEvent(synthetic("mouseup", at, { buttons: 0 }));
+    press.target.dispatchEvent(synthetic("mousedown", press, { shiftKey: true }));
+    document.dispatchEvent(synthetic("mousemove", at, { shiftKey: true }));
+  };
+  addEventListener("mousemove", followPointer, true);
+  addEventListener("keydown", takeDragBack, true);
+
   // Listening on the window catches a drag that is released past the pane edge.
   const finishDrag = (event) => {
+    if (event.workbenchRestarted) return;
+    grabbedPress = null;
     if (!dragFromHost) return;
     dragFromHost = false;
     const withShift = dragWithShift || event.shiftKey;
@@ -285,7 +385,23 @@ function createTerminal(session) {
     }, 0);
   };
   addEventListener("mouseup", finishDrag, true);
-  session.disposeWindowListeners = () => removeEventListener("mouseup", finishDrag, true);
+  session.disposeWindowListeners = () => {
+    removeEventListener("mouseup", finishDrag, true);
+    removeEventListener("mousemove", followPointer, true);
+    removeEventListener("keydown", takeDragBack, true);
+  };
+
+  // Ctrl+V, and a middle-click on Linux, reach xterm as a browser paste event, which
+  // xterm turns into input itself without going through `paste()`. It is taken over
+  // here, before it gets to xterm's own textarea, so it is cleaned like every other
+  // paste. A paste carrying files or an image never gets this far: the window's
+  // listener sends that to the remote folder first.
+  host.addEventListener("paste", (event) => {
+    const text = event.clipboardData?.getData("text/plain");
+    event.preventDefault();
+    event.stopPropagation();
+    if (text) pasteText(session, text);
+  }, true);
 
   host.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -312,11 +428,16 @@ function terminalKeys(session, event) {
   if (key === "F5") return false;
 
   // Copy: Ctrl+C with a selection, Ctrl+Shift+C, and the console's Ctrl+Insert.
+  // The browser's own copy is cancelled: on Linux xterm keeps the selection in its
+  // hidden textarea, and the native copy that follows the key would replace the
+  // text written here with the raw selection, indentation and all.
   if (control && lower === "c" && session.terminal.hasSelection()) {
+    event.preventDefault();
     copySelection(session, { verbatim: event.shiftKey });
     return false;
   }
   if (control && key === "Insert") {
+    event.preventDefault();
     copySelection(session);
     return false;
   }
@@ -438,6 +559,7 @@ async function activate(id) {
   }
   fitTerminal();
   session.terminal.focus();
+  if (session.pendingFollow) askToFollow(session);
 }
 
 function stepSession(delta) {
@@ -538,6 +660,10 @@ api.sessions.onStatus((status) => {
   if (!session || status.connected || !session.connected) return;
   session.connected = false;
   session.rowNodes.clear();
+  // A listing or a search still in flight is bound to fail now, and its error would
+  // land on the status line after this and take away the one thing worth saying.
+  session.request += 1;
+  session.pendingFollow = null;
   setMessage(session, `${status.message}. Use Reconnect to open it again.`, "error");
   session.terminal?.write(`\r\n\x1b[31m[${status.message}]\x1b[0m\r\n`);
   renderTabs();
@@ -546,6 +672,62 @@ api.sessions.onStatus((status) => {
     updateConnectionControls(session);
   }
 });
+
+// The file pane follows the user the terminal is working as: `sudo su` in the
+// terminal and the pane browses as root, `exit` and it goes back. The main process
+// decides from the remote process table; this only shows the result.
+api.sessions.onBrowseUser(async (state) => {
+  const session = workbench.sessions.get(state?.id);
+  if (!session || !session.connected) return;
+  const wanted = state.wanted === 0 ? "root" : `user ${state.wanted}`;
+  // Whatever the terminal did next supersedes a question still waiting to be asked.
+  session.pendingFollow = null;
+  if (state.needsPassword) {
+    // A tab in the background is not where anyone is looking, and a password dialog
+    // over the tab they are in would be asking about a terminal they cannot see. The
+    // question waits for the tab to be shown, rather than being answered "no" for
+    // them. The main process holds the switch open until it is answered.
+    session.pendingFollow = { wanted };
+    if (session === active()) askToFollow(session);
+    else setMessage(session, `The terminal is now working as ${wanted}; the file pane will ask for the sudo password when this tab is shown.`);
+    return;
+  }
+  if (state.failed) {
+    setMessage(session, `The terminal is working as ${wanted}, but the file pane cannot follow: ${state.failed}.`, "error");
+    return;
+  }
+  session.connection.browseAs = state.user;
+  if (session === active()) updateConnectionControls(session);
+  // Coming back from root usually means leaving a folder only root could read.
+  const shown = await refreshView(session);
+  if (!shown && !state.elevated) await loadDirectory(session, session.home);
+  setMessage(session, state.elevated
+    ? `Browsing as ${state.user}, following the terminal.`
+    : `Browsing as ${session.connection.username} again.`, "ok");
+});
+
+async function askToFollow(session) {
+  const pending = session.pendingFollow;
+  if (!pending || session.followAsking) return;
+  session.pendingFollow = null;
+  session.followAsking = true;
+  const { wanted } = pending;
+  try {
+    const followed = await passwordModal({
+      title: `Browse as ${wanted} too?`,
+      intro: `The terminal ${workbench.order.length > 1 ? `in ${session.label} ` : ""}is now working as ${wanted}. Enter the password sudo asks ${session.connection.username} for, and the file pane will browse as ${wanted} as well.`,
+      fields: [{ name: "password", label: `sudo password for ${session.connection.username}` }],
+      confirmLabel: `Browse as ${wanted}`,
+      run: ({ password }) => api.files.followPassword(session.id, password),
+    });
+    if (!followed && workbench.sessions.has(session.id) && session.connected) {
+      await api.files.declineFollow(session.id).catch(() => undefined);
+      setMessage(session, `The file pane is still browsing as ${session.connection.username}.`);
+    }
+  } finally {
+    session.followAsking = false;
+  }
+}
 
 api.terminal.onData((payload) => {
   workbench.sessions.get(payload?.id)?.terminal?.write(payload.data);
@@ -706,9 +888,12 @@ async function loadProfile(id) {
   }
   try {
     // Loading a connection fills in the form; it does not use a saved credential, so
-    // it asks for nothing. Choosing something from a list — or having it chosen for
-    // you at startup, because it was the last one used — is not a decision to hand
-    // over a password. That happens when Connect is pressed.
+    // it asks for nothing and is given nothing secret. Choosing something from a list
+    // — or having it chosen for you at startup, because it was the last one used — is
+    // not a decision to hand over a password. That happens when Connect is pressed,
+    // and the secrets go from the store straight into that connection without ever
+    // sitting in a field here, where a lock in this or another window could not
+    // reach them.
     const profile = await api.profiles.get(id);
     workbench.profileId = profile.id;
     workbench.profileLocked = Boolean(profile.needsUnlock);
@@ -725,27 +910,49 @@ async function loadProfile(id) {
     const locked = profile.needsUnlock
       ? `Loaded “${profile.name}”. Its master password is asked for when you connect.`
       : "";
-    connectMessage(profile.credentialError || locked || `Loaded “${profile.name}”`);
+    connectMessage(locked || `Loaded “${profile.name}”`);
   } catch (error) {
     connectMessage(cleanError(error));
   }
 }
 
 // Called from the connect path when the credentials are about to be used, whenever
-// the form is standing in for a saved connection without holding its secrets -- it was
-// loaded while they were locked, or it was refilled from a tab for Reconnect. The form
-// may have been edited since, so what comes out of the store fills only the fields
-// left empty, and only for the server it was saved for (see fillSavedSecrets).
+// the form is standing in for a saved connection that has credentials stored -- which
+// is every time, because the form never holds them: not when the connection was
+// chosen, and not when it was refilled from a tab for Reconnect. The form may have
+// been edited since, so what comes out of the store fills only the fields left empty,
+// and only for the server it was saved for (see fillSavedSecrets).
 //
 // The secrets are not written back into the form afterwards, so this runs again on the
 // next connect rather than once. Under "ask every time" that next connect is meant to
 // ask; otherwise it costs nothing anyone can see.
 async function withSavedCredentials(config) {
-  if (!workbench.profileId || !workbench.profileLocked) return config;
+  if (!workbench.profileId || !workbench.profileCredentialsPresent) return config;
+  // Nothing is read, and so nothing asked for, when every secret this connection
+  // could want has been typed in by hand -- or when it wants none, as with the agent.
+  if (!wantsSavedSecret(config)) return config;
   if (!await ensureVaultUnlocked()) throw new Error("The master password is needed to use this connection's saved credentials.");
-  const profile = await api.profiles.get(workbench.profileId);
-  if (profile.needsUnlock) throw new Error("Saved credentials are still locked.");
-  return fillSavedSecrets(config, profile.connection);
+  const saved = await api.profiles.secrets(workbench.profileId);
+  if (saved.needsUnlock) throw new Error("Saved credentials are still locked.");
+  if (saved.credentialError) {
+    // Damage is found here now, at the first read, rather than when the connection
+    // was chosen. Whatever was typed by hand can still be used; only a connection
+    // that is left with nothing to authenticate with is stopped, with the reason.
+    workbench.profileDamaged = true;
+    if (lacksPassword(config)) throw new Error(saved.credentialError);
+    return config;
+  }
+  return fillSavedSecrets(config, saved.connection);
+}
+
+function wantsSavedSecret(config) {
+  const empty = (hop) => (hop?.authType === "password" && !hop.password) || (hop?.authType === "key" && !hop.passphrase);
+  return empty(config) || Boolean(config.jump?.enabled && empty(config.jump));
+}
+
+function lacksPassword(config) {
+  const missing = (hop) => hop?.authType === "password" && !hop.password;
+  return missing(config) || Boolean(config.jump?.enabled && missing(config.jump));
 }
 
 // Reconnect refills the form from the tab, which carries no secrets, and the form has
@@ -859,6 +1066,11 @@ function passwordModal({ title, intro, fields, confirmLabel, policy = null, run 
     error.setAttribute("role", "alert");
     form.append(error);
 
+    // The dialog holds its buttons while this runs (see showModal), so an Enter
+    // pressed again while a password is still being checked does nothing. Each one
+    // would otherwise be another attempt: another wrong master password towards the
+    // lockout, or another failed sudo login on the host.
+    let page = null;
     const submit = async () => {
       error.textContent = "";
       const values = {};
@@ -866,7 +1078,7 @@ function passwordModal({ title, intro, fields, confirmLabel, policy = null, run 
       try {
         await run(values, policyControl ? policyControl.value() : null);
         finish(true);
-        closeModal();
+        closeModal(page);
       } catch (failure) {
         error.textContent = cleanError(failure);
         const first = inputs.values().next().value;
@@ -874,17 +1086,17 @@ function passwordModal({ title, intro, fields, confirmLabel, policy = null, run 
       }
     };
 
-    showModal(title, form, [
-      { label: "Cancel", run: () => closeModal() },
+    const first = inputs.values().next().value;
+    page = showModal(title, form, [
+      { label: "Cancel", run: () => closeModal(page) },
       { label: confirmLabel, primary: true, run: submit },
-    ], () => finish(false));
+    ], () => finish(false), { onShow: () => first?.focus() });
+    const confirm = page.querySelector(".modal-footer button:last-child");
     for (const input of inputs.values()) {
       input.onkeydown = (event) => {
-        if (event.key === "Enter") { event.preventDefault(); submit(); }
+        if (event.key === "Enter") { event.preventDefault(); confirm.click(); }
       };
     }
-    const first = inputs.values().next().value;
-    if (first) first.focus();
   });
 }
 
@@ -994,8 +1206,8 @@ function openMasterPasswordModal() {
         if (password !== repeat) throw new Error("Those two passwords are not the same");
         const status = applyVaultStatus(await api.vault.set(password, policy));
         await refreshProfiles($("saved-profile").value);
-        connectMessage(status.dropped
-          ? `Master password set. ${status.dropped} saved credential${status.dropped === 1 ? "" : "s"} could not be read and ${status.dropped === 1 ? "was" : "were"} cleared.`
+        connectMessage(status.carried
+          ? `Master password set. ${carriedNote(status.carried)}`
           : "Master password set; saved credentials were re-encrypted with it.");
       },
     });
@@ -1026,10 +1238,17 @@ function changeMasterPassword() {
     confirmLabel: "Change it",
     run: async ({ current, password, repeat }) => {
       if (password !== repeat) throw new Error("Those two passwords are not the same");
-      applyVaultStatus(await api.vault.change(current, password));
-      connectMessage("Master password changed.");
+      const status = applyVaultStatus(await api.vault.change(current, password));
+      connectMessage(status.carried ? `Master password changed. ${carriedNote(status.carried)}` : "Master password changed.");
     },
   });
+}
+
+// Credentials the keyring could not open just now are kept, not cleared, and are
+// re-encrypted the first time they are used with the keyring back. Saying nothing
+// would leave someone believing every credential had been moved across.
+function carriedNote(count) {
+  return `${count} saved credential${count === 1 ? "" : "s"} could not be re-encrypted because the operating system keyring is unavailable; ${count === 1 ? "it was" : "they were"} kept as before, ${count === 1 ? "needs" : "need"} the new master password to be used, and ${count === 1 ? "is" : "are"} re-encrypted the next time ${count === 1 ? "it is" : "they are"} used.`;
 }
 
 function changeUnlockPolicy() {
@@ -1072,12 +1291,12 @@ function removeMasterPassword() {
 
 $("master-manage").addEventListener("click", () => openMasterPasswordModal());
 
-// Locking has to take back the copy this window is already holding, and not only the
-// key in the other process. Choosing a saved connection fills the form from the store,
-// so by the time anyone reaches for this the password can already be sitting in a
-// field -- where it would still open a connection with nothing further asked, which is
-// the one thing locking exists to stop. Both ways of locking come through here, so
-// neither can quietly stop doing half of it.
+// Locking takes back whatever this window is holding, and not only the key in the
+// other process. A saved connection's secrets never reach the form any more, but a
+// password typed into it would still open a connection with nothing further asked,
+// which is the one thing locking exists to stop. Both ways of locking come through
+// here, and every other window does the same when it hears of the lock (see
+// api.vault.onChanged below), so none of them can quietly stop doing half of it.
 async function lockSavedCredentials() {
   applyVaultStatus(await api.vault.lock(), { refreshList: true });
   clearFormSecrets();
@@ -1085,6 +1304,21 @@ async function lockSavedCredentials() {
   // again, exactly as it would have been had it been chosen after the lock.
   workbench.profileLocked = Boolean(workbench.profileId && workbench.profileCredentialsPresent);
 }
+
+// Every window is told about every change to the vault, whichever window made it:
+// one process holds it, so a master password set, removed, unlocked or locked in one
+// window is set, removed, unlocked or locked in all of them. A lock from elsewhere is
+// treated exactly like one made here. A timed unlock simply running out is not a
+// lock anyone asked for, and it does not wipe out what is being typed.
+api.vault.onChanged((status) => {
+  const before = workbench.vault;
+  const changed = before?.configured !== status?.configured || before?.unlocked !== status?.unlocked;
+  applyVaultStatus(status, { refreshList: changed });
+  if (status?.reason === "lock") {
+    clearFormSecrets();
+    workbench.profileLocked = Boolean(workbench.profileId && workbench.profileCredentialsPresent);
+  }
+});
 
 $("master-lock").addEventListener("click", async () => {
   await lockSavedCredentials();
@@ -1153,6 +1387,7 @@ $("save-profile").addEventListener("click", async () => {
       replaced,
       keepingCredentials,
       credentialsSaved: saved.credentialsSaved,
+      credentialsDropped: saved.credentialsDropped || [],
     });
     workbench.profileDamaged = outcome.damaged;
     workbench.profileCredentialsPresent = Boolean(saved.credentialsSaved);
@@ -1255,8 +1490,9 @@ $("disconnect").addEventListener("click", async () => {
 function updateConnectionControls(session) {
   const online = Boolean(session && session.connected);
   const scpMode = online && session.connection.protocol === "scp" ? " · SCP" : "";
+  const browseAs = online && session.connection.browseAs ? ` · browsing as ${session.connection.browseAs}` : "";
   $("connection-label").textContent = session
-    ? `${sessionLabel(session.connection)}${session.connection.jump ? ` via ${sessionLabel(session.connection.jump)}` : ""}${scpMode}${online ? "" : " — disconnected"}`
+    ? `${sessionLabel(session.connection)}${session.connection.jump ? ` via ${sessionLabel(session.connection.jump)}` : ""}${scpMode}${browseAs}${online ? "" : " — disconnected"}`
     : "";
   $("reconnect").classList.toggle("hidden", !session || online);
   for (const id of ["up", "home", "refresh", "search", "clear-search", "search-scope", "upload-files",
@@ -1323,7 +1559,7 @@ async function loadDirectory(session, directory) {
     }
     return true;
   } catch (error) {
-    if (sequence === session.request) setMessage(session, cleanError(error), "error");
+    if (sequence === session.request && session.connected) setMessage(session, cleanError(error), "error");
     return false;
   }
 }
@@ -1352,7 +1588,7 @@ async function runSearch(session) {
     setMessage(session, describeSearch(result), result.truncated ? "" : result.entries.length ? "ok" : "");
     return true;
   } catch (error) {
-    if (sequence === session.request) setMessage(session, cleanError(error), "error");
+    if (sequence === session.request && session.connected) setMessage(session, cleanError(error), "error");
     return false;
   }
 }
@@ -1633,7 +1869,15 @@ function renderRows(session) {
     link.draggable = false;
     link.className = "name-link";
     link.textContent = item.name;
-    link.onclick = (event) => { event.preventDefault(); openItem(session, item); };
+    // A name opens on one click, and what it opens is drawn under the pointer at
+    // once, so the second click of a double-click -- the habit from every file
+    // manager -- would land on whatever row took this one's place and open that too.
+    // A click counting as the second of a pair is not a request of its own.
+    link.onclick = (event) => {
+      event.preventDefault();
+      if (event.detail > 1) return;
+      openItem(session, item);
+    };
     block.append(link);
     if (item.location !== undefined) {
       const where = document.createElement("span");
@@ -1747,6 +1991,9 @@ async function openItem(session, item) {
   }
   if (entry.directory) return openDirectory(session, entry.path);
   if (isImage(entry.name)) {
+    // An image too large to preview is not one nobody wants: it downloads, the same
+    // as a text file too large to edit, rather than ending in an error.
+    if (entry.size > PREVIEW_IMAGE_LIMIT) return downloadItems(session, [entry]);
     try {
       const data = await api.files.readBinary(session.id, entry.path);
       const blob = new Blob([data], { type: imageType(entry.name) });
@@ -1761,21 +2008,40 @@ async function openItem(session, item) {
     } catch (error) { setMessage(session, cleanError(error), "error"); }
     return;
   }
-  if (entry.size > 2 * 1024 * 1024) return downloadItems(session, [entry]);
+  if (entry.size > EDIT_LIMIT) return downloadItems(session, [entry]);
   try {
-    const contents = await api.files.read(session.id, entry.path);
-    showEditor(session, entry, contents);
+    // Refused, with a reason worth reading, for anything that is not a regular file,
+    // is too large, or is not UTF-8 text -- a Latin-1 file opened here would have its
+    // accented letters replaced on the first save.
+    const file = await api.files.read(session.id, entry.path);
+    showEditor(session, entry, file);
   } catch (error) { setMessage(session, cleanError(error), "error"); }
 }
 
 /* ------------------------------------------------------------------ modals */
 
-let modalCleanup = null;
-function showModal(title, body, actions = [], cleanup = null) {
-  if (modalCleanup) modalCleanup();
-  modalCleanup = cleanup;
-  const modal = $("modal");
-  modal.replaceChildren();
+// One dialog is shown at a time, and one that wants the screen while another is
+// open waits its turn instead of taking that one's place. Most dialogs open because
+// someone clicked something, but some arrive on their own -- a queued drop reaching
+// its name-clash question, the file pane asking for a sudo password -- and one of
+// those replacing whatever was open used to throw away what was in it: the text in
+// an editor, or the answer to another upload's question, since a name-clash dialog
+// closed unanswered cancels its upload. A waiting dialog is built straight away and
+// kept, hidden, behind the one being shown, so whoever opened it can already reach
+// into it; `onShow` runs when it actually comes up, which is when it can take focus.
+//
+// The one exception is a dialog opened by a button of the dialog being shown, such as
+// "Change…" in the master password dialog. That is the same dialog moving on to its
+// next step, so it takes the place of the first.
+const modalPages = [];
+const modalPageOf = new WeakMap();
+let modalActionOf = null;
+
+function showModal(title, body, actions = [], cleanup = null, { dismiss = null, onShow = null, backdropCloses = true, note = null } = {}) {
+  const element = document.createElement("div");
+  element.className = "modal-page";
+  const page = { element, cleanup, dismiss, onShow, backdropCloses, busy: false };
+  modalPageOf.set(element, page);
   const header = document.createElement("header");
   header.className = "modal-header";
   const heading = document.createElement("h2");
@@ -1786,68 +2052,294 @@ function showModal(title, body, actions = [], cleanup = null) {
   close.textContent = "×";
   close.title = "Close";
   close.setAttribute("aria-label", "Close");
-  close.onclick = closeModal;
+  close.onclick = () => dismissModal(page);
   header.append(heading, spacer, close);
   const content = document.createElement("div");
   content.className = "modal-body";
   content.append(body);
   const footer = document.createElement("footer");
   footer.className = "modal-footer";
+  if (note) footer.append(note);
   for (const action of actions) {
     const button = document.createElement("button");
     button.textContent = action.label;
     if (action.primary) button.className = "primary";
     if (action.danger) button.className = "danger";
-    button.onclick = action.run;
+    button.onclick = (event) => runModalAction(page, action, event);
     footer.append(button);
   }
-  modal.append(header, content, footer);
-  $("modal-backdrop").classList.remove("hidden");
-  return modal;
-}
-function closeModal() {
-  if (modalCleanup) modalCleanup();
-  modalCleanup = null;
-  $("modal-backdrop").classList.add("hidden");
-  $("modal").replaceChildren();
-  active()?.terminal?.focus();
-}
-$("modal-backdrop").onclick = (event) => { if (event.target === $("modal-backdrop")) closeModal(); };
+  element.append(header, content, footer);
 
-function showEditor(session, item, contents) {
+  const replacing = modalActionOf && modalActionOf === modalPages[0] ? modalActionOf : null;
+  if (replacing) {
+    modalPages.shift();
+    replacing.element.remove();
+    runModalCleanup(replacing);
+  }
+  if (modalPages.length && !replacing) {
+    element.hidden = true;
+    modalPages.push(page);
+    $("modal").append(element);
+    return element;
+  }
+  modalPages.unshift(page);
+  $("modal").prepend(element);
+  showFrontModal();
+  return element;
+}
+
+// An action that returns a promise holds every button of its dialog until it has
+// settled, so a second click or a second Enter -- which the dialogs' fields turn into
+// a click -- cannot start the same thing again while the first is still running: a
+// folder created twice, a deletion sent twice, a password tried twice.
+function runModalAction(page, action, event) {
+  if (page.busy) return;
+  modalActionOf = page;
+  let result;
+  try { result = action.run(event); } finally { modalActionOf = null; }
+  if (!result || typeof result.then !== "function") return;
+  page.busy = true;
+  const restore = holdModalButtons(page);
+  Promise.resolve(result).catch(() => undefined).then(() => {
+    page.busy = false;
+    restore();
+  });
+}
+
+// Disables a dialog's buttons and returns what puts them back as they were, so two
+// holds that overlap undo in the order they were made.
+function holdModalButtons(page) {
+  const buttons = Array.from(page.element.querySelectorAll(".modal-header button, .modal-footer button"));
+  const before = buttons.map((button) => button.disabled);
+  for (const button of buttons) button.disabled = true;
+  return () => buttons.forEach((button, index) => { button.disabled = before[index]; });
+}
+
+function runModalCleanup(page) {
+  const cleanup = page.cleanup;
+  page.cleanup = null;
+  if (cleanup) cleanup();
+}
+
+function showFrontModal() {
+  const page = modalPages[0];
+  if (!page) {
+    $("modal-backdrop").classList.add("hidden");
+    active()?.terminal?.focus();
+    return;
+  }
+  page.element.hidden = false;
+  $("modal-backdrop").classList.remove("hidden");
+  if (page.onShow) page.onShow(page.element);
+}
+
+// Closes one dialog: the one whose element is given, or else the one being shown --
+// which is what a button wired straight to `closeModal` means, since it receives the
+// click event. A dialog that has already gone is left gone, so work finishing late
+// cannot close whichever dialog has come up since.
+function closeModal(which) {
+  const page = which instanceof Element ? modalPageOf.get(which) : modalPages[0];
+  const index = page ? modalPages.indexOf(page) : -1;
+  if (index < 0) return;
+  modalPages.splice(index, 1);
+  page.element.remove();
+  runModalCleanup(page);
+  if (index === 0) showFrontModal();
+}
+
+// Escape, the × in the corner, and a click on the dimmed area. A dialog can ask to
+// decide this for itself, as the editor does; otherwise it closes, unless it is busy.
+function dismissModal(page = modalPages[0]) {
+  if (!page) return;
+  if (page.dismiss) {
+    page.dismiss();
+    return;
+  }
+  if (page.busy) return;
+  closeModal(page.element);
+}
+
+// A click whose `detail` is above one is the second half of a double-click that
+// opened the dialog -- on a file name, say -- and not a request to close it.
+$("modal-backdrop").onclick = (event) => {
+  if (event.target !== $("modal-backdrop") || event.detail > 1) return;
+  const page = modalPages[0];
+  if (page && page.backdropCloses) dismissModal(page);
+};
+
+// The text editor. What is typed into it is the one thing a dialog holds that cannot
+// be had back, so it never closes on a stray click on the dimmed area, and Escape, ×
+// and Close ask first when there is an edit to lose.
+//
+// What was read is kept beside the text: the line endings the file had, because a
+// textarea only ever holds LF and they are put back on save; and the size and time
+// the file had, so a save can tell when the file has been changed on the host since
+// -- by a deploy, or in the terminal beside it -- and ask instead of replacing that.
+function showEditor(session, item, file) {
+  const body = document.createElement("div");
+  body.className = "editor";
+  const notice = document.createElement("div");
+  notice.className = "editor-notice hidden";
+  notice.setAttribute("role", "alert");
   const textarea = document.createElement("textarea");
-  textarea.value = contents;
-  showModal(item.name, textarea, [
-    { label: "Download", run: async () => { await downloadItems(session, [item]); } },
-    { label: "Close", run: closeModal },
-    { label: "Save", primary: true, run: async () => {
-      try {
-        await api.files.write(session.id, item.path, textarea.value);
-        closeModal();
-        setMessage(session, `Saved ${item.name}`, "ok");
-        await refreshView(session);
-      } catch (error) { setMessage(session, cleanError(error), "error"); }
-    } },
-  ]);
-  textarea.focus();
+  textarea.spellcheck = false;
+  body.append(notice, textarea);
+  const note = document.createElement("span");
+  note.className = "modal-note";
+
+  const state = { saved: "", eol: "\n", stamp: null, error: "", saving: false };
+  let question = null;
+  let page = null;
+  const dirty = () => textarea.value !== state.saved;
+  const sync = () => {
+    const parts = [];
+    if (state.eol === "\r\n") parts.push("CRLF line endings, kept on save");
+    if (dirty()) parts.push("Unsaved changes");
+    note.textContent = state.error || parts.join(" · ");
+    note.classList.toggle("status-error", Boolean(state.error));
+  };
+  const load = (loaded) => {
+    textarea.value = String(loaded?.text ?? "");
+    // Read back rather than taken from what was loaded: a textarea makes changes of
+    // its own -- a lone CR becomes LF -- and comparing against those is what keeps
+    // an untouched file from counting as edited.
+    state.saved = textarea.value;
+    state.eol = loaded?.eol === "\r\n" ? "\r\n" : "\n";
+    state.stamp = loaded?.stamp || null;
+    state.error = "";
+    sync();
+  };
+  const fail = (error) => {
+    state.error = cleanError(error);
+    sync();
+  };
+  textarea.addEventListener("input", () => {
+    state.error = "";
+    sync();
+  });
+
+  // A question asked inside the editor rather than in a dialog over it, which would
+  // have to take the editor's place. Resolves to the value of the button chosen, or
+  // to the cancelling one's on Escape. The editor's own buttons wait meanwhile.
+  const ask = (text, choices) => new Promise((resolve) => {
+    const restore = holdModalButtons(modalPageOf.get(page));
+    const message = document.createElement("span");
+    message.textContent = text;
+    notice.replaceChildren(message);
+    const cancel = choices.find((choice) => choice.cancel);
+    const answer = (value) => {
+      question = null;
+      notice.classList.add("hidden");
+      notice.replaceChildren();
+      restore();
+      resolve(value);
+    };
+    for (const choice of choices) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = choice.label;
+      if (choice.danger) button.className = "danger";
+      button.onclick = () => answer(choice.value);
+      notice.append(button);
+    }
+    question = { cancel: () => answer(cancel?.value) };
+    notice.classList.remove("hidden");
+    notice.querySelectorAll("button")[choices.indexOf(cancel)]?.focus();
+  });
+
+  const requestClose = async () => {
+    if (dirty()) {
+      const discard = await ask(`Discard the changes to ${item.name}?`, [
+        { label: "Keep editing", value: false, cancel: true },
+        { label: "Discard changes", value: true, danger: true },
+      ]);
+      if (!discard) {
+        textarea.focus();
+        return;
+      }
+    }
+    closeModal(page);
+  };
+
+  const reload = async () => {
+    try {
+      load(await api.files.read(session.id, item.path));
+      note.textContent = `Reloaded ${item.name} from the host.`;
+    } catch (error) { fail(error); }
+    textarea.focus();
+  };
+
+  const save = async (expect = state.stamp) => {
+    const text = textarea.value;
+    let result;
+    state.saving = true;
+    textarea.readOnly = true;
+    try {
+      result = await api.files.write(session.id, item.path, text, { eol: state.eol, expect: expect || undefined });
+    } catch (error) {
+      fail(error);
+      return;
+    } finally {
+      state.saving = false;
+      textarea.readOnly = false;
+    }
+    if (result && result.ok === false && result.changed) {
+      const choice = await ask(`${item.name} has been changed on the host since it was opened here. Saving now would replace that change.`, [
+        { label: "Cancel", value: "cancel", cancel: true },
+        { label: "Reload", value: "reload" },
+        { label: "Overwrite", value: "overwrite", danger: true },
+      ]);
+      // Overwriting is checked against what is there now, so a third change made
+      // while this was being asked is still caught rather than replaced unseen.
+      if (choice === "overwrite") return save(result.stamp);
+      if (choice === "reload") return reload();
+      textarea.focus();
+      return;
+    }
+    state.stamp = result?.stamp || null;
+    state.saved = text;
+    closeModal(page);
+    // After the listing, which says "Ready" when it lands and would otherwise take
+    // the confirmation away as soon as it appeared.
+    await refreshView(session);
+    setMessage(session, `Saved ${item.name}`, "ok");
+  };
+
+  page = showModal(item.name, body, [
+    { label: "Download", run: () => downloadItems(session, [item]) },
+    { label: "Close", run: requestClose },
+    { label: "Save", primary: true, run: () => save() },
+  ], null, {
+    note,
+    backdropCloses: false,
+    onShow: () => textarea.focus(),
+    dismiss: () => {
+      if (question) question.cancel();
+      else if (!state.saving) requestClose();
+    },
+  });
+  load(file);
 }
 
 function promptModal(session, title, initial, confirmLabel, callback) {
   const input = document.createElement("input");
   input.value = initial;
-  showModal(title, input, [
-    { label: "Cancel", run: closeModal },
+  let page = null;
+  page = showModal(title, input, [
+    { label: "Cancel", run: () => closeModal(page) },
     { label: confirmLabel, primary: true, run: async () => {
       try {
         await callback(input.value);
-        closeModal();
+        closeModal(page);
         await refreshView(session);
       } catch (error) { setMessage(session, cleanError(error), "error"); }
     } },
-  ]);
-  input.select();
+  ], null, { onShow: () => { input.focus(); input.select(); } });
+  // Enter clicks the button rather than calling the action itself, so a second Enter
+  // meets the button held while the first one runs.
+  const confirm = page.querySelector(".modal-footer button:last-child");
   input.onkeydown = (event) => {
-    if (event.key === "Enter") $("modal").querySelector(".modal-footer button:last-child").click();
+    if (event.key === "Enter") { event.preventDefault(); confirm.click(); }
   };
 }
 
@@ -2030,13 +2522,15 @@ function askUploadConflicts(plan) {
 
     // Nothing is "already taken" when the clash is only between two dropped items.
     const heading = onHost ? "Some names are already taken" : "Some names are used more than once";
+    // It may have to wait behind another dialog -- an editor, say -- and only takes
+    // focus when it comes up.
     const modal = showModal(heading, body, [
-      { label: "Cancel", run: closeModal },
+      { label: "Cancel", run: () => closeModal(modal) },
       { label: "Upload", primary: true, run: () => {
         settle(Object.fromEntries(choices));
-        closeModal();
+        closeModal(modal);
       } },
-    ], () => settle(null));
+    ], () => settle(null), { onShow: (element) => element.querySelector(".modal-footer button:last-child").focus() });
 
     // The confirm button carries the weight of the choices behind it, so it reads as
     // a destructive action exactly when one of them is.
@@ -2063,7 +2557,6 @@ function askUploadConflicts(plan) {
       confirm.classList.toggle("danger", counts.replaced > 0 || counts.lastOnly > 0);
     }
     sync();
-    confirm.focus();
   });
 }
 
@@ -2157,17 +2650,17 @@ $("delete").onclick = withSession((session) => {
   if (!items.length) return;
   const body = document.createElement("p");
   body.textContent = `Permanently delete ${items.length} selected item${items.length === 1 ? "" : "s"} from ${session.label}?`;
-  showModal("Confirm remote deletion", body, [
-    { label: "Cancel", run: closeModal },
+  const page = showModal("Confirm remote deletion", body, [
+    { label: "Cancel", run: () => closeModal(page) },
     { label: "Delete", danger: true, run: async () => {
       try {
         const result = await api.files.delete(session.id, items.map((item) => item.path));
-        closeModal();
+        closeModal(page);
         await refreshView(session);
         setMessage(session, `Deleted ${result.deleted}; ${result.failures.length} failed.`,
           result.failures.length ? "error" : "ok");
       } catch (error) {
-        closeModal();
+        closeModal(page);
         setMessage(session, cleanError(error), "error");
       }
     } },
@@ -2306,17 +2799,18 @@ $("restart-terminal").onclick = withSession(async (session) => {
 const HELP_SECTIONS = [
   ["Terminal · selecting and copying", [
     ["Drag", "Select text. Nothing is copied yet."],
-    ["Shift+drag", "Select and copy immediately. Shift also forces a local selection while a remote program such as vim, tmux, or less is using the mouse."],
+    ["Shift+drag", "Select and copy immediately. Shift also forces a local selection while a remote program such as Claude Code, vim, tmux, or less is using the mouse, even when pressed after the drag has started."],
     ["Double-click", "Select a word."],
     ["Triple-click", "Select a whole line."],
     ["Enter", "Copy and clear a selection made with the mouse, as the Windows console does. With no such selection it is an ordinary Enter."],
     ["Right-click", "Copy the selection; paste when nothing is selected."],
     ["Ctrl+C", "Copy the selection with its common leading indentation removed, so pasted commands run. Sends SIGINT when nothing is selected."],
     ["Ctrl+Shift+C", "Copy the selection exactly, indentation included."],
-    ["Ctrl+Insert", "Copy the selection exactly."],
+    ["Ctrl+Insert", "Copy the selection with its common leading indentation removed, as Ctrl+C does."],
+    ["Alt+drag", "Select a rectangle of columns rather than whole lines. Copying it removes the indentation its lines share, as with any other selection."],
   ]],
   ["Terminal · pasting and scrolling", [
-    ["Ctrl+V", "Paste clipboard text. An image or copied file goes to the remote folder instead."],
+    ["Ctrl+V", "Paste clipboard text. An image or copied file goes to the remote folder instead. Every paste has control characters such as Escape taken out first, so pasted text cannot act as keystrokes; tabs and line breaks are kept."],
     ["Ctrl+Shift+V", "Paste clipboard text."],
     ["Shift+Insert", "Paste clipboard text."],
     ["Wheel", "Scroll the scrollback; 10000 lines are kept per session."],
@@ -2346,11 +2840,12 @@ const HELP_SECTIONS = [
   ["Remote files", [
     ["Ctrl+F", "Focus the search box. Choose Subfolders or Current folder beside it."],
     ["F5", "Refresh the listing, or re-run the current search."],
-    ["Click a name", "Open a folder, edit a text file, preview an image, or download anything over 2 MB."],
+    ["Click a name", "Open a folder, edit a text file, or preview an image. A text file over 2 MB or an image over 20 MB downloads instead. A file that is not UTF-8 text is refused by the editor; download it instead."],
+    ["The editor", "Escape, × and Close ask before discarding an edit, and a click outside does nothing. Save keeps CRLF line endings, and asks — overwrite, reload, or cancel — when the file was changed on the host after it was opened."],
     ["Click a row", "Select it. Column headings sort; click again to reverse."],
     ["Delete", "Delete the selected remote items after confirmation."],
     ["F2", "Rename the single selected item."],
-    ["Escape", "Clear the search box, close the open dialog, or put the shown folder back in the path box."],
+    ["Escape", "Clear the search box, close the open dialog (the editor asks first if there are unsaved edits), or put the shown folder back in the path box."],
   ]],
   ["Paths in and out", [
     ["The path box", "Always a text field holding the folder shown. Select it to copy the path out, or type or paste a path over it and press Enter to go there."],
@@ -2437,7 +2932,7 @@ addEventListener("keydown", (event) => {
   const lower = key.toLowerCase();
   const control = event.ctrlKey || event.metaKey;
   if (!$("modal-backdrop").classList.contains("hidden")) {
-    if (key === "Escape") closeModal();
+    if (key === "Escape") dismissModal();
     return;
   }
   const inWorkspace = !$("workspace").classList.contains("hidden");

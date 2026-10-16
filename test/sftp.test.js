@@ -425,7 +425,7 @@ test("keeps both local copies when a download name already exists", async () => 
 test("edits, creates, renames, and recursively deletes remote items", async () => {
   await withSession(async ({ manager, remoteRoot }) => {
     fs.writeFileSync(path.join(remoteRoot, "notes.txt"), "first line\n");
-    assert.equal(await manager.readFile(path.posix.join(remoteRoot, "notes.txt")), "first line\n");
+    assert.equal((await manager.readFile(path.posix.join(remoteRoot, "notes.txt"))).text, "first line\n");
     await manager.writeFile(path.posix.join(remoteRoot, "notes.txt"), "second line\n");
     assert.equal(fs.readFileSync(path.join(remoteRoot, "notes.txt"), "utf8"), "second line\n");
 

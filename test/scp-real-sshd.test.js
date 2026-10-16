@@ -227,7 +227,7 @@ test("real folders: created, filled, renamed, walked, searched and removed", { s
 
     const editable = path.posix.join(created.path, "notes.ini");
     await manager.writeFile(editable, "mode=first\n");
-    assert.equal(await manager.readFile(editable), "mode=first\n");
+    assert.equal((await manager.readFile(editable)).text, "mode=first\n");
     await manager.writeFile(editable, "mode=second\n");
     assert.equal(fs.readFileSync(editable, "utf8"), "mode=second\n");
 

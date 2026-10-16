@@ -139,10 +139,15 @@ contextBridge.exposeInMainWorld("sshWorkbench", Object.freeze({
     disconnect: (id) => ipcRenderer.invoke("sessions:disconnect", id),
     close: (id) => ipcRenderer.invoke("sessions:close", id),
     onStatus: (callback) => subscribe("session:status", callback),
+    onBrowseUser: (callback) => subscribe("session:browse-user", callback),
   }),
   profiles: Object.freeze({
     list: () => ipcRenderer.invoke("profiles:list"),
+    // Everything about a saved connection except its secrets.
     get: (id) => ipcRenderer.invoke("profiles:get", id),
+    // Its secrets, decrypted, for a connection that is being opened now. This is a
+    // use of the credential, and is called for nothing else.
+    secrets: (id) => ipcRenderer.invoke("profiles:secrets", id),
     save: (profile) => ipcRenderer.invoke("profiles:save", profile),
     delete: (id) => ipcRenderer.invoke("profiles:delete", id),
     security: () => ipcRenderer.invoke("profiles:security"),
@@ -157,14 +162,19 @@ contextBridge.exposeInMainWorld("sshWorkbench", Object.freeze({
     unlock: (password) => ipcRenderer.invoke("vault:unlock", password),
     lock: () => ipcRenderer.invoke("vault:lock"),
     policy: (password, policy) => ipcRenderer.invoke("vault:policy", password, policy),
+    // Every window hears about every change, whichever window made it.
+    onChanged: (callback) => subscribe("vault:changed", callback),
   }),
   files: Object.freeze({
     list: (id, directory) => ipcRenderer.invoke("files:list", id, directory),
+    followPassword: (id, password) => ipcRenderer.invoke("files:follow-password", id, password),
+    declineFollow: (id) => ipcRenderer.invoke("files:decline-follow", id),
     search: (id, directory, query, recursive) => ipcRenderer.invoke("files:search", id, directory, query, recursive),
     resolve: (id, remoteFile) => ipcRenderer.invoke("files:resolve", id, remoteFile),
     read: (id, remoteFile) => ipcRenderer.invoke("files:read", id, remoteFile),
     readBinary: (id, remoteFile) => ipcRenderer.invoke("files:read-binary", id, remoteFile),
-    write: (id, remoteFile, contents) => ipcRenderer.invoke("files:write", id, remoteFile, contents),
+    // `options` is `{ eol, expect }`: the line ending and the stamp `read` returned.
+    write: (id, remoteFile, contents, options) => ipcRenderer.invoke("files:write", id, remoteFile, contents, options),
     mkdir: (id, directory, name) => ipcRenderer.invoke("files:mkdir", id, directory, name),
     rename: (id, remoteFile, name) => ipcRenderer.invoke("files:rename", id, remoteFile, name),
     delete: (id, paths) => ipcRenderer.invoke("files:delete", id, paths),

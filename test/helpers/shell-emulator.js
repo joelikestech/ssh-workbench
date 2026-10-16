@@ -10,6 +10,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { WRAPPER } = require("../../lib/shell-transport");
 
 function tokenize(text) {
   const tokens = [];
@@ -88,7 +89,8 @@ function stripRedirections(tokens) {
 }
 
 function permissions(stats) {
-  const type = stats.isDirectory() ? "d" : stats.isSymbolicLink() ? "l" : "-";
+  const type = stats.isDirectory() ? "d" : stats.isSymbolicLink() ? "l" : stats.isFIFO() ? "p"
+    : stats.isCharacterDevice() ? "c" : stats.isBlockDevice() ? "b" : stats.isSocket() ? "s" : "-";
   const bits = [0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001];
   return type + bits.map((bit, position) => (stats.mode & bit ? "rwx"[position % 3] : "-")).join("");
 }
@@ -97,14 +99,17 @@ function listingLine(name, stats, target) {
   const size = String(stats.size);
   const seconds = Math.floor(stats.mtimeMs / 1000);
   const shown = stats.isSymbolicLink() && target ? `${name} -> ${target}` : name;
-  return `${permissions(stats)} 1 1000 1000 ${size.padStart(6)} ${seconds} ${shown}`;
+  return `${permissions(stats)} 1 ${stats.uid} ${stats.gid} ${size.padStart(6)} ${seconds} ${shown}`;
 }
 
 class ShellEmulator {
-  constructor(root, { scp = true, timeStyle = true } = {}) {
+  // `wrapper: false` is a login shell that runs only the commands it is named --
+  // the restricted shells and ForceCommand wrappers that refuse `exec /bin/sh`.
+  constructor(root, { scp = true, timeStyle = true, wrapper = true } = {}) {
     this.root = root;
     this.scp = scp;
     this.timeStyle = timeStyle;
+    this.wrapper = wrapper;
   }
 
   resolve(value) {
@@ -114,7 +119,34 @@ class ShellEmulator {
 
   // `scp -t` and `scp -f` are conversations rather than commands, so they are run
   // against the live channel; everything else produces text and an exit code.
-  run(commandLine, stream) {
+  //
+  // The transport sends its command lines to /bin/sh on standard input, behind a
+  // fixed wrapper the login shell sees. That first line is read off here, exactly as
+  // `read` would, and whatever followed it is handed on to the command it names.
+  // `onCommand` hears every command line actually run, wrapped or not.
+  run(commandLine, stream, onCommand = () => undefined) {
+    if (commandLine === WRAPPER && this.wrapper) {
+      let pending = Buffer.alloc(0);
+      const take = (chunk) => {
+        pending = Buffer.concat([pending, chunk]);
+        const end = pending.indexOf(0x0a);
+        if (end < 0) return;
+        stream.removeListener("data", take);
+        const rest = pending.subarray(end + 1);
+        try {
+          this.run(pending.subarray(0, end).toString("utf8"), stream, onCommand);
+        } catch (error) {
+          stream.stderr.write(`sh: ${error.message}\n`);
+          stream.exit(1);
+          stream.end();
+          return;
+        }
+        if (rest.length) stream.emit("data", rest);
+      };
+      stream.on("data", take);
+      return undefined;
+    }
+    onCommand(commandLine);
     const first = split(commandLine)[0];
     const opening = stripRedirections(tokenize(first.text)).tokens.filter((token) => !/^[A-Z_]+=/.test(token));
     if (opening[0] === "scp" && this.scp) {
@@ -172,6 +204,29 @@ class ShellEmulator {
             return this.scp ? finish({ stdout: "/usr/bin/scp\n" }) : finish({ code: 1 });
           }
           return finish({ code: 1 });
+        }
+        case "test": {
+          let operands = rest;
+          const negate = operands[0] === "!";
+          if (negate) operands = operands.slice(1);
+          const [flag, operand] = operands;
+          const target = this.resolve(operand);
+          const link = fs.lstatSync(target, { throwIfNoEntry: false });
+          const followed = fs.statSync(target, { throwIfNoEntry: false });
+          const answers = { "-e": Boolean(followed), "-h": Boolean(link?.isSymbolicLink()), "-L": Boolean(link?.isSymbolicLink()), "-d": Boolean(followed?.isDirectory()) };
+          if (!(flag in answers)) return finish({ stderr: `test: ${flag}: unknown operator\n`, code: 2 });
+          return finish({ code: answers[flag] !== negate ? 0 : 1 });
+        }
+        case "chmod": {
+          const [mode, target] = rest.filter((token) => token !== "--");
+          fs.chmodSync(this.resolve(target), parseInt(mode, 8));
+          return finish({});
+        }
+        case "chown": {
+          const [owner, target] = rest.filter((token) => token !== "--");
+          const [uid, gid] = owner.split(":").map(Number);
+          fs.chownSync(this.resolve(target), uid, gid);
+          return finish({});
         }
         case "readlink": {
           const target = this.resolve(rest[rest.length - 1]);

@@ -91,7 +91,9 @@ SCP mode is a genuine fallback, not a second first-class protocol. In it:
   `ls` does not, they are read from the abbreviated date and can be a year out
   either side of the present.
 - A POSIX shell and `scp` are required. Where `scp` is missing, the connection
-  says so at once rather than failing at the first transfer.
+  says so at once rather than failing at the first transfer. The login shell
+  itself can be anything: each command line is handed to `/bin/sh` on standard
+  input, so a csh, tcsh or fish login shell never parses it.
 - Every path is single-quoted before it reaches the shell, so a filename
   containing quotes, spaces, `$(...)`, or a leading `-` is a filename and not
   syntax.
@@ -155,13 +157,25 @@ and mouse action, including the file pane and drag-and-drop ones.
 | `Ctrl+C` | Copy the selection, or send SIGINT when there is none |
 | `Ctrl+Insert` | Copy the selection |
 | `Ctrl+Shift+C` | Copy the selection exactly as it is on screen |
+| `Alt`+drag | Select a rectangle of columns rather than whole lines |
 | `Ctrl+V`, `Ctrl+Shift+V`, `Shift+Insert` | Paste text into the shell |
+
+Every paste — the keys above, right-click, a middle-click on Linux — has control
+characters taken out before it reaches the shell: everything below space except
+tab, LF and CR, plus DEL and the C1 controls. With them gone, clipboard text that
+carries its own end-of-paste marker (`ESC [201~`) cannot end the shell's bracketed
+paste early and have the rest run as typed commands.
+
+A copy longer than the clipboard channel takes at once (200,000 characters) is cut
+there, and the status line says so instead of reporting it as copied.
 
 Remote programs that ask for the mouse — `vim`, `tmux`, `less`, `htop` — receive
 clicks, drags, and wheel movement in both the classic `ESC [ M` and the SGR
 encodings. While such a program has the mouse, dragging belongs to it rather than
 to local selection; holding `Shift` takes the drag back so text can still be
-selected and copied, which is otherwise impossible.
+selected and copied, which is otherwise impossible. `Shift` pressed after the drag
+has started works too: the program is told the button came up, and the text from
+where the drag began is selected and copied. The program has still seen the click.
 
 ### Indentation is not part of the copy
 
@@ -184,6 +198,8 @@ output:
 puts `hooks:` at the left margin with its children still two and four spaces in.
 A margin of spaces and a margin of tabs are compared as text rather than counted,
 so lines that do not genuinely share a margin are left alone rather than sliced.
+An `Alt`+drag rectangle starts every line at the same column, and each loses the
+same margin.
 
 `Ctrl+Shift+C` is the one that copies byte for byte, for when the leading
 whitespace is the point. Copy and paste both go through the application rather
@@ -209,6 +225,42 @@ The trade is xterm's `Shift`+click-to-extend, which is gone while the mouse is
 local: drag to select, and `Enter`, right-click or `Ctrl+C` to copy. Inside a
 program that has taken the mouse — `vim`, `tmux`, `less` — nothing changes, because
 there `Shift` is what takes the drag back and already starts a selection.
+
+## The file pane follows `sudo su`
+
+When the terminal becomes root — `sudo su`, `sudo -i`, `sudo -s` — the file pane
+browses as root too, and when that shell exits it goes back to the user who logged
+in. The connection label says `browsing as root` while it lasts.
+
+Nothing typed or printed is interpreted to decide this. Shortly after each `Enter`
+(or `Ctrl+D`), and once more two seconds later, the application reads the remote
+process table on a separate channel, finds this tab's terminal, and follows its
+foreground process down — including into the pty sudo allocates for the command it
+runs. Only a shell from the host's `/etc/shells`, sitting at its prompt (started
+with no script and no `-c`), counts: its real user is the user the terminal is
+working as. While a command runs — `sudo vim`, `sudo apt upgrade`,
+`sudo sh -c '…'`, `sudo bash ./install.sh` — the pane stays where it is, and a
+prompt that merely ends in `#` changes nothing.
+
+A switch never interrupts a transfer: it waits until uploads, downloads and other
+file operations in progress have finished.
+
+Browsing as root uses the host's own `sftp-server`, started through `sudo` on its
+own channel. sudo is tried first without a password; if it asks for one, the
+password used to log in is offered (it is the one sudo wants), and if there is
+none — key or agent login — the pane asks for it once and keeps it in memory for the
+rest of the connection. A password sudo refuses is forgotten immediately and never
+offered again, since each refusal counts as a failed login on the host. The
+password is sent to sudo as soon as it asks, whatever its prompt says, so PAM
+prompts from LDAP, SSSD or Kerberos work too. Declining leaves the pane as the login user until the
+terminal changes user again. When the change happens in a tab that is not the one
+shown, the question waits until that tab is shown rather than being declined.
+
+Limits: it needs SFTP (not SCP mode), `ps` and `sudo` on the host, and a host that
+lets the login user see other users' processes (`/proc` mounted with `hidepid`
+hides them). `su -` with the root password works only if the login user may also
+use sudo. Shells inside `tmux` or `screen` belong to their server rather than to the
+terminal, so they are not followed.
 
 ## Searching remote names and paths
 
@@ -261,7 +313,9 @@ the pace; narrowing the starting folder helps far more than narrowing the text.
 Enter the destination, authentication, optional jump host, and starting folder.
 Give it a name in **Saved connections**, choose whether to save passwords and
 passphrases, then select **Save connection**. Selecting that name later restores
-the complete connection with one click.
+the complete connection with one click. Names are unique regardless of letter case:
+saving a new connection under a name that is already taken is refused rather than
+replacing the existing one.
 
 `Enter` connects from anywhere on the connection form — including from a dropdown,
 which a browser form would not submit from on its own. With a saved connection
@@ -279,6 +333,9 @@ Private-key paths are part of the normal profile. Passwords and passphrases are
 stored only when **Save passwords and key passphrases using OS encryption** is
 enabled. SSH-agent profiles need no saved credential because the agent performs
 authentication. Deleting a profile removes its encrypted credential blob too.
+A saved password or passphrase belongs to the server it was saved for: editing a
+hop's host, port, or user and saving drops that hop's stored secrets (the save
+message says so), while the other hop keeps its own.
 
 ### Master password
 
@@ -294,13 +351,16 @@ until it is.
 Choose when it is needed again:
 
 - **Every time saved credentials are used.** The key is discarded as soon as it
-  has been used once.
+  has been used once, or after a minute if it is not used at all.
 - **Once, then again after N minutes** (1 to 1440; 15 by default). Each use moves
   the window along, so a working session is not interrupted.
 
 **Lock now**, or `Ctrl+Shift+L`, locks immediately. One process holds the vault,
 so unlocking in one window unlocks the saved credentials for all of them, and
-locking does the same in reverse.
+locking does the same in reverse: every window is told at once, and a lock clears
+any password typed into each window's form. A saved connection's own secrets never
+sit in the form at all; they go from the store to the connection when **Connect**
+is pressed.
 
 The password itself is stored nowhere. It needs at least six characters. A random
 16-byte salt and scrypt (N = 65536, r = 8, p = 1) turn it into a 32-byte key, which
@@ -322,9 +382,30 @@ so before you confirm.
 
 Changing the master password re-encrypts every saved credential in memory and
 writes the file once, so an interruption cannot leave some connections readable
-with the old password and some with the new. A forgotten master password cannot
+with the old password and some with the new. A credential the operating system
+keyring cannot open at that moment is kept, not cleared: it is carried across as it
+is, still needs the (new) master password to be used, and is re-encrypted the first
+time it is used with the keyring back. Removing the master password is refused, with
+the connections named, if it would otherwise lose one. A forgotten master password cannot
 be recovered: remove it, and enter the connection passwords again as you use
 them.
+
+## Editing remote files
+
+Clicking a file's name opens text in an editor and previews an image. A text file
+over 2 MB, or an image over 20 MB, downloads instead. The editor takes UTF-8 text
+only: a file in another encoding, or one with NUL bytes, is refused with the reason
+rather than opened, since saving it would replace every character it could not read.
+
+- Escape, `×` and **Close** ask before discarding unsaved changes, and a click
+  outside the editor does nothing.
+- Line endings are kept: a CRLF file is saved with CRLF.
+- If the file was changed on the host after it was opened, **Save** says so and
+  offers **Overwrite**, **Reload** (the host's version, losing the edit) or
+  **Cancel** (keep editing).
+- A dialog that comes up on its own while the editor is open — an upload asking
+  about a name that is already taken, the file pane asking for a sudo password —
+  waits until the editor is closed instead of replacing it.
 
 ## The path bar
 
@@ -521,6 +602,10 @@ distribution should add an appropriate Windows or macOS signing identity.
   through an explicit, length-limited channel instead.
 - A corrupt saved-connection or host-fingerprint file is set aside rather than
   trusted or silently overwritten, and the application reports that it happened.
+  Each damaged copy gets a name of its own, entries this version does not
+  recognise are kept in the file (and the file copied first), and a file written by
+  a newer version is used but not written over. A store that is a symbolic link
+  stays one.
 - Hostnames, usernames, and key paths are written to disk only through **Save
   connection**. Nothing about a connection is retained implicitly, and any record
   left by a version before 0.9.1 is cleared on first run.
@@ -535,9 +620,24 @@ distribution should add an appropriate Windows or macOS signing identity.
   the folder chosen for it, or a deletion reach a sibling of the folder selected.
 - A recursive download additionally checks that every file it is about to write
   stays under the folder it was sent to, and refuses to write through a symbolic
-  link that is already sitting at the target name.
+  link that is already sitting at the target name. Inside the folder, a link that
+  leads outside it, a link to nothing, and anything that is not an ordinary file
+  (a pipe, device or socket) are left out, and the download then names them. A
+  pipe or device is never opened or read, in the editor either. On Windows, a `\`
+  or `:` in a remote name is written as `_`, since either would change where the
+  file lands.
+- A transfer is written under a hidden temporary name (`.name.swb-….part`) beside
+  its destination and takes the real name only once complete, in both directions
+  and for editor saves. One that fails part way leaves the old file, or nothing,
+  under the real name. An overwrite keeps the old file's mode and owner and
+  replaces what a shortcut points at, not the shortcut; where the host will not
+  allow a new file in that folder, or the owner cannot be kept, it is written in
+  place as before.
 - Host keys are verified before authentication. A changed key requires an
-  explicit replacement confirmation.
+  explicit replacement confirmation. Host names are compared without regard to
+  letter case, a trailing dot, or IPv6 brackets, and only one trust prompt per host
+  is open at a time. The connection's time limit pauses while a prompt is open, and
+  an answer given after the connection has failed is ignored.
 - Saved passwords and passphrases cross the isolated bridge only for profile
   operations and connection requests, and are encrypted at rest by Electron's
   OS-backed safe storage.
@@ -668,7 +768,9 @@ There is also an end-to-end check that launches the actual application, drives i
 over the Chrome DevTools Protocol, and verifies tab isolation, inbound drops of
 real local files, outbound drag staging, and reconnection — including reconnecting a dropped tab with
 its own saved credentials, locked and unlocked, while another saved connection is
-showing in the form:
+showing in the form — and the editor and dialogs: unsaved edits kept, dialogs that
+wait their turn, buttons that cannot run twice, and pastes that cannot carry
+control characters:
 
 ```bash
 npm run e2e              # needs a display

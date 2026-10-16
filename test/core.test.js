@@ -217,12 +217,16 @@ test("stores named connection credentials only as encrypted data", () => {
     const disk = fs.readFileSync(file, "utf8");
     assert.doesNotMatch(disk, /destination-secret|jump-secret|unused-target-passphrase|unused-jump-password/);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-    const loaded = profiles.get(saved.id);
+    // Choosing a connection shows it without its secrets; they come out only for
+    // the connection that is being opened.
+    assert.equal(profiles.get(saved.id).connection.password, "");
+    assert.equal(profiles.get(saved.id).connection.jump.passphrase, "");
+    const loaded = profiles.secrets(saved.id);
     assert.equal(loaded.connection.password, "destination-secret");
     assert.equal(loaded.connection.passphrase, "");
     assert.equal(loaded.connection.jump.passphrase, "jump-secret");
     assert.equal(loaded.connection.jump.password, "");
-    assert.equal(loaded.startPath, "~/project");
+    assert.equal(profiles.get(saved.id).startPath, "~/project");
     profiles.delete(saved.id);
     assert.deepEqual(profiles.list(), []);
   } finally {
@@ -253,7 +257,7 @@ test("refuses to persist secrets without secure encryption", () => {
     input.saveCredentials = false;
     const saved = profiles.save(input);
     assert.equal(saved.credentialsSaved, false);
-    assert.equal(profiles.get(saved.id).connection.password, "");
+    assert.equal(profiles.secrets(saved.id).connection.password, "");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -491,7 +495,7 @@ test("a connection saved before the protocol existed keeps trying SFTP first", (
     });
     const profile = reloaded.get(saved.id);
     assert.equal(profile.connection.protocol, "sftp-scp");
-    assert.equal(profile.connection.password, "hunter2", "a version 1 secret is still readable");
+    assert.equal(reloaded.secrets(saved.id).connection.password, "hunter2", "a version 1 secret is still readable");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -514,7 +518,7 @@ test("setting a master password re-encrypts what was already saved", async () =>
   const { store, directory, file } = storeFixture();
   try {
     const saved = store.save({ name: "Production", connection: CONNECTION, saveCredentials: true });
-    assert.equal(store.get(saved.id).connection.password, "hunter2");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2");
 
     const vault = new Vault({});
     store.attachVault(vault);
@@ -523,7 +527,7 @@ test("setting a master password re-encrypts what was already saved", async () =>
     vault.adopt(created);
 
     assert.equal(store.list()[0].masterPassword, true);
-    assert.equal(store.get(saved.id).connection.password, "hunter2", "still readable while unlocked");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2", "still readable while unlocked");
     assert.doesNotMatch(fs.readFileSync(file, "utf8"), /hunter2/, "and not readable in the file");
 
     vault.lock();
@@ -533,7 +537,7 @@ test("setting a master password re-encrypts what was already saved", async () =>
     assert.equal(locked.credentialError, null, "being locked is not an error");
 
     await vault.unlock("a good long password");
-    assert.equal(store.get(saved.id).connection.password, "hunter2");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -553,7 +557,7 @@ test("changing the master password leaves the old one useless and the new one wo
     const second = await vault.create("the second password", vault.policy);
     store.changeMasterPassword({ oldKey, newKey: second.key, config: second.config });
     vault.adopt(second);
-    assert.equal(store.get(saved.id).connection.password, "hunter2");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2");
 
     const reopened = new Vault({ config: vault.toJSON() });
     await assert.rejects(() => reopened.unlock("the first password"), /not correct/);
@@ -585,7 +589,7 @@ test("removing the master password hands the secrets back to the keyring", async
     assert.equal(store.list()[0].masterPassword, false);
     const profile = store.get(saved.id);
     assert.equal(profile.needsUnlock, false);
-    assert.equal(profile.connection.password, "hunter2");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -628,18 +632,20 @@ test("re-saving a connection whose credentials are locked keeps them", async () 
     assert.equal(shown.needsUnlock, true);
     assert.equal(shown.connection.password, "", "a locked credential is not handed out");
 
-    // Changing the port and pressing Save must not be a way to lose the password.
-    // Nothing about the credential is being touched, so it does not need the key
-    // either: this succeeds while the vault is still locked.
+    // Changing the protocol or the start path and pressing Save must not be a way to
+    // lose the password. Nothing about the credential is being touched, so it does not
+    // need the key either: this succeeds while the vault is still locked. (Changing
+    // the port is different: that is another server, whose password this is not.)
     const resaved = store.save({
-      id: saved.id, name: "Prod", startPath: shown.startPath, saveCredentials: true,
-      connection: { ...shown.connection, port: 2222 },
+      id: saved.id, name: "Prod", startPath: "/srv/app", saveCredentials: true,
+      connection: { ...shown.connection, protocol: "scp" },
     });
     assert.equal(resaved.credentialsSaved, true, "the stored credential survived the save");
+    assert.deepEqual(resaved.credentialsDropped, []);
 
     await vault.unlock("a good long password");
-    const after = store.get(saved.id);
-    assert.equal(after.connection.port, 2222, "and the edit that was actually asked for landed");
+    const after = store.secrets(saved.id);
+    assert.equal(after.connection.protocol, "scp", "and the edit that was actually asked for landed");
     assert.equal(after.connection.password, "hunter2");
 
     // Clearing the tick is the one thing that means "stop saving credentials".
@@ -710,7 +716,7 @@ test("changing one saved credential leaves the other alone, in every combination
               }
               resave();
               if (!vault.unlocked) await vault.unlock("a good long password");
-              const after = store.get(saved.id).connection;
+              const after = store.secrets(saved.id).connection;
               assert.equal(after[FIELD[targetAuth]], typeTarget ? "typed-target" : "stored-target",
                 `${where}: destination secret`);
               assert.equal(after.jump[JUMP_FIELD[jumpAuth]], typeJump ? "typed-jump" : "stored-jump",
@@ -752,7 +758,7 @@ test("a change that cannot be written to disk does not survive in memory", async
 
     // Nothing the interface was told did not happen may be visible afterwards.
     assert.deepEqual(store.list().map((profile) => profile.name), ["Kept"], "no rejected profile was added or removed");
-    const still = store.get(kept.id);
+    const still = store.secrets(kept.id);
     assert.equal(still.connection.host, CONNECTION.host, "the rejected edit is not showing");
     assert.equal(still.connection.password, "hunter2", "and the credential is still readable");
     assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), before, "the file on disk never moved");
@@ -791,9 +797,11 @@ test("credentials that cannot be read can be replaced, but only on purpose", asy
     // The keyring changes underneath it, which is what makes a stored secret
     // permanently unreadable rather than merely locked.
     era.value = "two";
-    const loaded = store.get(saved.id);
+    // Choosing it decrypts nothing, so finds nothing wrong; connecting is what finds out.
+    assert.equal(store.get(saved.id).credentialError, null);
+    const loaded = store.secrets(saved.id);
     assert.match(loaded.credentialError, /could not be decrypted/);
-    assert.equal(loaded.credentialsSaved, false, "it cannot be used");
+    assert.equal(loaded.connection.password, "", "it cannot be used");
     assert.equal(loaded.credentialsPresent, true, "but it is still there, and still worth keeping");
 
     const retyped = { ...CONNECTION, password: "typed-again" };
@@ -810,18 +818,18 @@ test("credentials that cannot be read can be replaced, but only on purpose", asy
       assert.equal(error.unreadableCredentials, true, "the caller can tell this apart and offer the choice");
       assert.match(error.message, /replaced with what you have entered|discarded by saving without credentials/);
     }
-    assert.equal(store.get(saved.id).credentialError, loaded.credentialError, "and nothing changed on the way");
+    assert.equal(store.secrets(saved.id).credentialError, loaded.credentialError, "and nothing changed on the way");
 
     // Asked, it replaces them.
     resave(true);
-    assert.equal(store.get(saved.id).connection.password, "typed-again");
-    assert.equal(store.get(saved.id).credentialError, null);
+    assert.equal(store.secrets(saved.id).connection.password, "typed-again");
+    assert.equal(store.secrets(saved.id).credentialError, null);
 
     // The other way out still works too: discard by saving without credentials.
     era.value = "three";
     store.save({ id: saved.id, name: "Prod", startPath: "~", saveCredentials: false, connection: CONNECTION });
     assert.equal(store.get(saved.id).credentialsSaved, false);
-    assert.equal(store.get(saved.id).credentialError, null, "the damaged blob is gone rather than still complaining");
+    assert.equal(store.secrets(saved.id).credentialError, null, "the damaged blob is gone rather than still complaining");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -847,7 +855,7 @@ test("a master password that could not be stored is not the one in force", async
     assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), before, "the file never moved");
     assert.equal(store.list().find((profile) => profile.id === kept.id).masterPassword, false,
       "and nothing in memory thinks a master password is protecting it");
-    assert.equal(store.get(kept.id).connection.password, "hunter2", "the keyring credential is still readable");
+    assert.equal(store.secrets(kept.id).connection.password, "hunter2", "the keyring credential is still readable");
 
     // A policy that could not be stored must not be the one this process enforces.
     vault.adopt(created);
@@ -969,7 +977,7 @@ test("a temporary keyring outage cannot discard an existing credential", () => {
     state.available = false;
     const unavailable = store.get(saved.id);
     assert.equal(unavailable.credentialsPresent, true);
-    assert.match(unavailable.credentialError, /could not be decrypted/);
+    assert.match(store.secrets(saved.id).credentialError, /could not be decrypted/);
     const keepingCredentials = credentialsBoxChecked(unavailable, { secureStorage: false });
     assert.equal(keepingCredentials, true, "the unavailable keyring does not clear retention");
 
@@ -977,12 +985,12 @@ test("a temporary keyring outage cannot discard an existing credential", () => {
     // the keyring. When the keyring comes back, both it and the edit are there.
     store.save({
       id: saved.id, name: "Prod", startPath: "/srv", saveCredentials: keepingCredentials,
-      connection: { ...unavailable.connection, port: 2222 },
+      connection: { ...unavailable.connection, protocol: "scp" },
     });
     state.available = true;
-    const restored = store.get(saved.id);
+    const restored = store.secrets(saved.id);
     assert.equal(restored.connection.password, "hunter2");
-    assert.equal(restored.connection.port, 2222);
+    assert.equal(restored.connection.protocol, "scp");
 
     // Trying to replace it during another outage fails without changing the good
     // blob. Even an explicitly confirmed replacement has nowhere safe to land.
@@ -990,10 +998,10 @@ test("a temporary keyring outage cannot discard an existing credential", () => {
     assert.throws(() => store.save({
       id: saved.id, name: "Prod", startPath: "/srv", saveCredentials: true,
       replaceCredentials: true,
-      connection: { ...unavailable.connection, port: 2222, password: "replacement" },
+      connection: { ...unavailable.connection, protocol: "scp", password: "replacement" },
     }), /Secure credential storage is unavailable/);
     state.available = true;
-    assert.equal(store.get(saved.id).connection.password, "hunter2");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -1010,13 +1018,13 @@ test("with no keyring, a master password is what makes saving credentials possib
     vault.adopt(await vault.create("a good long password", { mode: "minutes", minutes: 15 }));
     store.saveVaultConfig(vault.toJSON());
     const saved = store.save({ name: "No keyring", connection: CONNECTION, saveCredentials: true });
-    assert.equal(store.get(saved.id).connection.password, "hunter2");
+    assert.equal(store.secrets(saved.id).connection.password, "hunter2");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test("a credential that can no longer be read does not block a master password", async () => {
+test("a credential that cannot be read now does not block a master password, and is not lost to it", async () => {
   const { store, directory } = storeFixture();
   try {
     const good = store.save({ name: "Readable", connection: CONNECTION, saveCredentials: true });
@@ -1044,9 +1052,14 @@ test("a credential that can no longer be read does not block a master password",
     const result = reloaded.applyMasterPassword(created);
     vault.adopt(created);
 
-    assert.deepEqual(result, { rewrapped: 1, dropped: 1 });
-    assert.equal(reloaded.get(good.id).connection.password, "hunter2", "the readable one came across");
-    assert.equal(reloaded.get(bad.id).credentialsSaved, false, "and the damaged one was cleared, not kept");
+    assert.deepEqual(result, { rewrapped: 1, carried: 1, dropped: 0 });
+    assert.equal(reloaded.secrets(good.id).connection.password, "hunter2", "the readable one came across");
+    // A keyring that cannot open it today may open it tomorrow, so it is kept as it
+    // was -- and using it still needs the master password.
+    assert.equal(reloaded.get(bad.id).credentialsSaved, true, "the unreadable one is kept, not cleared");
+    assert.equal(reloaded.list().find((profile) => profile.id === bad.id).masterPassword, true);
+    vault.lock();
+    assert.equal(reloaded.get(bad.id).needsUnlock, true);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -1172,10 +1185,10 @@ test("a download will not write through a shortcut that is already there", async
 });
 
 test("an ordinary name that merely looks odd is still an ordinary name", () => {
-  for (const name of ["...", ".hidden", "a:b", "12:30 notes.txt", "it's fine", "-dashes", "spaced out.tar.gz"]) {
+  for (const name of ["...", ".hidden", "a:b", "12:30 notes.txt", "it's fine", "-dashes", "spaced out.tar.gz", "mnt-data\\x2dbackup.mount"]) {
     assert.equal(safeRemoteName(name), true, `${name} should be allowed`);
   }
-  for (const name of ["", ".", "..", "a/b", "a\\b", "../../escape", "nul\0byte"]) {
+  for (const name of ["", ".", "..", "a/b", "../../escape", "nul\0byte"]) {
     assert.equal(safeRemoteName(name), false, `${JSON.stringify(name)} should be refused`);
   }
 });
@@ -1232,6 +1245,22 @@ test("copies a terminal selection without the indentation it all shared", () => 
   assert.equal(cleanCopy("  spaces\n\ttab"), "  spaces\n\ttab");
   assert.equal(cleanCopy(""), "");
   assert.equal(cleanCopy("   "), "");
+});
+
+test("a selection begun on the first character still loses the margin it is printed at", () => {
+  // A heredoc copied out of indented output, dragged from the `c` of `cat`: the
+  // first line arrives bare and the rest two spaces in. Without the column every
+  // later line kept its spaces and the indented `EOF` never closed the heredoc.
+  const dragged = "cat > /tmp/x <<'EOF'\n  line one\n    nested\n  EOF";
+  assert.equal(cleanCopy(dragged, { startColumn: 2 }), "cat > /tmp/x <<'EOF'\nline one\n  nested\nEOF");
+  assert.equal(cleanCopy(dragged), dragged, "without the column there was nothing to go on");
+  // A drag that starts after a prompt on a row whose other lines are flush removes
+  // nothing, and adds nothing to the first line.
+  assert.equal(cleanCopy("echo hi\nhi", { startColumn: 2 }), "echo hi\nhi");
+  // A first line that started deeper than the rest keeps only its own text.
+  assert.equal(cleanCopy("deep\n  shallow", { startColumn: 6 }), "deep\nshallow");
+  // A single line is unaffected by where it began.
+  assert.equal(cleanCopy("ls -la", { startColumn: 4 }), "ls -la");
 });
 
 test("identifies an installation by the file that was launched", () => {
@@ -1337,4 +1366,25 @@ test("tells a copy's own helper processes from a foreign build", () => {
     otherInstallations([{ pid: 11, path: "/dist/electron", installation: null }],
       { installation: "/stand/in", pid: 1, execPath: "/dist/electron", identify: () => null }),
     []);
+});
+
+test("a column selection is cut at the same column on every line, so all lose the same margin", () => {
+  const { cleanCopy: clean } = require("../lib/terminal-copy");
+  // Screen: "      alpha" / "      beta", Alt+dragged from column 4. Every line of a
+  // rectangle starts at that column, so padding only the first would leave it deeper.
+  assert.equal(clean("  alpha\n  beta", { startColumn: 4, column: true }), "alpha\nbeta");
+  assert.equal(clean("  alpha\n    nested\n  beta", { startColumn: 4, column: true }), "alpha\n  nested\nbeta");
+  // The same text as an ordinary selection means its later lines began at column 0.
+  assert.equal(clean("  alpha\n  beta", { startColumn: 4 }), "  alpha\nbeta");
+});
+
+test("pasted text loses every control character but tab, LF and CR", () => {
+  const { cleanPaste } = require("../lib/terminal-copy");
+  // The bracketed-paste terminator inside the clipboard cannot end the bracket.
+  assert.equal(cleanPaste("echo harmless\x1b[201~\rtouch marker\r"), "echo harmless[201~\rtouch marker\r");
+  assert.equal(cleanPaste("a\tb\r\nc\n"), "a\tb\r\nc\n");
+  assert.equal(cleanPaste("\x00\x07\x08\x0b\x0c\x1f\x7f\x80\x9b\x9fok"), "ok");
+  // Printable text outside ASCII is left alone, C1 controls are not.
+  assert.equal(cleanPaste("café ✓  x"), "café ✓  x");
+  assert.equal(cleanPaste(undefined), "");
 });

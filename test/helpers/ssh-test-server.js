@@ -56,8 +56,11 @@ function attachSftp(sftp, root, latency) {
   // the server, is what a recursive search waits on.
   const slowly = (run) => (latency ? setTimeout(run, latency) : run());
 
+  // Links are resolved, as OpenSSH's realpath does; the download code relies on it
+  // to tell a link that stays inside a folder from one that leads out of it.
   sftp.on("REALPATH", (reqid, requested) => guard(reqid, () => {
-    const target = requested === "." || requested === "" ? root : path.posix.resolve(root, requested);
+    let target = requested === "." || requested === "" ? root : path.posix.resolve(root, requested);
+    try { target = fs.realpathSync(target); } catch { /* a path that does not exist yet */ }
     sftp.name(reqid, [{ filename: target, longname: target, attrs: {} }]);
   }));
 
@@ -144,7 +147,13 @@ function attachSftp(sftp, root, latency) {
     fs.renameSync(source, target);
     sftp.status(reqid, STATUS_CODE.OK);
   }));
-  sftp.on("SETSTAT", (reqid) => sftp.status(reqid, STATUS_CODE.OK));
+  // The mode is applied, because an overwrite sets it on its temporary copy and the
+  // tests check that it survives. Owner changes are accepted and ignored: the tests
+  // run as one user, so there is never a different owner to keep.
+  sftp.on("SETSTAT", (reqid, target, attrs) => guard(reqid, () => {
+    if (typeof attrs?.mode === "number") fs.chmodSync(target, attrs.mode & 0o7777);
+    sftp.status(reqid, STATUS_CODE.OK);
+  }));
   sftp.on("FSETSTAT", (reqid) => sftp.status(reqid, STATUS_CODE.OK));
   sftp.on("SYMLINK", (reqid, target, linkPath) => guard(reqid, () => {
     fs.symlinkSync(target, linkPath);
@@ -172,14 +181,14 @@ function generateHostKey() {
 // what the client answered is recorded so a test can see what it was told.
 function startTestServer({
   root, username = "tester", password = "secret", latency = 0, authDelay = 0,
-  refuseSftp = false, scp = true, timeStyle = true, keyboardInteractive = null,
+  refuseSftp = false, scp = true, timeStyle = true, keyboardInteractive = null, wrapper = true,
 }) {
   const hostKeyPair = generateHostKey();
   const hostKey = hostKeyPair.private;
   const shells = [];
   const received = [];
   const commands = [];
-  const shell = new ShellEmulator(root, { scp, timeStyle });
+  const shell = new ShellEmulator(root, { scp, timeStyle, wrapper });
   // Mutable so a test can switch the subsystem off on a host it has already
   // trusted, which is what exercises the fallback without a second host key.
   const sftpEnabled = { value: !refuseSftp };
@@ -241,9 +250,8 @@ function startTestServer({
       });
       session.on("exec", (execAccept, _reject, info) => {
         const stream = execAccept();
-        commands.push(String(info.command));
         try {
-          shell.run(String(info.command), stream);
+          shell.run(String(info.command), stream, (line) => commands.push(line));
         } catch (error) {
           stream.stderr.write(`sh: ${error.message}\n`);
           stream.exit(1);

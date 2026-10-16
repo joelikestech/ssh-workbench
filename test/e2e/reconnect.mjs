@@ -215,7 +215,7 @@ async function main() {
   };
 
   // 1. The reported case: unlocked, Alpha opened from the list, its link dropped.
-  assert.equal(await select(ids.Alpha), "alpha-secret", "an unlocked connection fills its password on loading");
+  assert.equal(await select(ids.Alpha), "", "choosing a connection puts nothing secret in the form, even unlocked");
   await submit();
   await connectedTabs(1);
   let form = await dropAndReconnect(alpha);
@@ -229,7 +229,7 @@ async function main() {
   // 2. The list moves on to Bravo for a second tab; Alpha's link drops again. Its
   //    reconnect has to use Alpha's password, not the one now showing in the form.
   await evaluate(session, `$("new-session").click(); return true;`);
-  assert.equal(await select(ids.Bravo), "bravo-secret");
+  assert.equal(await select(ids.Bravo), "");
   await submit();
   await connectedTabs(2);
   await evaluate(session, `document.querySelectorAll("#tabstrip .tab")[0].click(); return true;`);
