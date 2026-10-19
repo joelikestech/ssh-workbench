@@ -512,6 +512,28 @@ async function main() {
   assert.equal(await clipboard(), "untouched", "a plain drag selects without touching the clipboard");
   console.log("• a plain drag selects and leaves the clipboard alone");
 
+  // A drag with the middle button -- the scroll wheel held down -- copies like
+  // Shift+drag. On Linux the middle button's release would also paste the primary
+  // selection, which xterm has just filled with the dragged text; none of that may
+  // reach the shell.
+  const middleDragAcrossFirstLine = async () => {
+    const y = terminalBox.top + 14;
+    await mouse("mousePressed", terminalBox.left + 10, y, { button: "middle" });
+    for (const step of [1, 2, 3]) {
+      await mouse("mouseMoved", terminalBox.left + 10 + (110 * step) / 3, y, { button: "middle", buttons: 4 });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    await mouse("mouseReleased", terminalBox.left + 120, y, { button: "middle" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  };
+  await setClipboard("untouched");
+  const inputBeforeMiddle = server.received().length;
+  await middleDragAcrossFirstLine();
+  const middleCopied = await clipboard();
+  assert.match(middleCopied, /test/, `a middle-drag copies (clipboard held ${JSON.stringify(middleCopied)})`);
+  assert.equal(server.received().slice(inputBeforeMiddle), "", "a middle-drag sends nothing to the shell");
+  console.log(`• a middle-drag copies ("${middleCopied.trim()}") and pastes nothing`);
+
   // Indented output, copied the way it actually arrives: a YAML fragment printed
   // inside a tool's own indentation, which is unusable in a file unless the shared
   // depth comes off on the way to the clipboard.
@@ -769,6 +791,32 @@ async function main() {
   assert.equal(server.mouseReports() - beforeShift, 0, "Shift must keep the drag away from the remote program");
   assert.match(await clipboard(), /test/, "Shift+drag still selects and copies while the mouse is grabbed");
   console.log(`• a remote program can grab the mouse (${grabbedReports} reports forwarded); Shift overrides it`);
+
+  await setClipboard("untouched");
+  const beforeMiddle = server.mouseReports();
+  await middleDragAcrossFirstLine();
+  assert.equal(server.mouseReports() - beforeMiddle, 0, "a middle-drag must stay away from the remote program");
+  assert.match(await clipboard(), /test/, "a middle-drag still copies while the mouse is grabbed");
+  console.log("• a middle-drag copies while the mouse is grabbed, and the program sees none of it");
+
+  // A plain middle click is not a drag, so the program gets it after all: a press of
+  // the middle button and a release, nothing selected and nothing copied. A wheel
+  // pressed with a little wobble is still a click.
+  {
+    await setClipboard("untouched");
+    const y = terminalBox.top + 14;
+    const reportsBeforeClick = server.mouseReports();
+    await mouse("mousePressed", terminalBox.left + 40, y, { button: "middle" });
+    await mouse("mouseMoved", terminalBox.left + 42, y + 1, { button: "middle", buttons: 4 });
+    await mouse("mouseReleased", terminalBox.left + 42, y + 1, { button: "middle" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const reports = server.received().split("\u001b[M").slice(-(server.mouseReports() - reportsBeforeClick));
+    assert.equal(reports.length, 2, `the program saw one press and one release (${reports.length} reports)`);
+    assert.equal(reports[0][0], "!", "the press is reported as the middle button");
+    assert.equal(reports[1][0], "#", "and then the button coming up");
+    assert.equal(await clipboard(), "untouched", "a middle click copies nothing");
+    console.log("• a middle click still reaches the program as a middle press and release");
+  }
 
   // Shift pressed only after the drag has begun -- the press has already gone to the
   // program. The drag is taken back: the program is told the button came up, and the
@@ -1274,6 +1322,58 @@ async function main() {
     `pasting with the terminal focused must still upload; status: ${pastedFromTerminal.message}`);
   assert.doesNotMatch(pastedFromTerminal.shell, /PNG|IHDR/, "and no image bytes were typed into the shell");
   console.log("• a screenshot pasted with the terminal focused still uploads");
+
+  // A right-click pastes text only: a screenshot on the real system clipboard is not
+  // uploaded from it, and nothing reaches the shell. Shift+Insert then uploads the
+  // same image, which shows it really was on the clipboard.
+  {
+    // The page may not write an image to the clipboard, so a second Electron process
+    // puts one there, as a snipping tool would, and holds it until it is killed: on
+    // X11 a clipboard empties when the program that owns it exits.
+    const helperDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-workbench-e2e-clipboard-"));
+    fs.writeFileSync(path.join(helperDirectory, "main.cjs"), `
+      const { app, clipboard, nativeImage } = require("electron");
+      app.whenReady().then(() => {
+        // A real 4x4 PNG: the one-pixel one above is only ever sent as bytes and does not decode.
+        const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg==", "base64");
+        clipboard.writeImage(nativeImage.createFromBuffer(png));
+        console.log("image-on-clipboard");
+      });
+    `);
+    const holder = spawn(path.join(repository, "node_modules", ".bin", "electron"),
+      [path.join(helperDirectory, "main.cjs"), `--user-data-dir=${path.join(helperDirectory, "profile")}`],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    onCleanup(() => { if (!holder.killed) holder.kill("SIGKILL"); });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("the clipboard helper never put its image up")), 20000);
+      holder.stdout.on("data", (chunk) => { if (String(chunk).includes("image-on-clipboard")) { clearTimeout(timer); resolve(); } });
+    });
+    await waitFor(session, `(await window.sshWorkbench.clipboard.read()) === ""`,
+      "the application to see the clipboard holding no text, only the image");
+    await evaluate(session, `document.querySelector("#terminals > div:not(.hidden) .xterm-helper-textarea").focus(); return true;`);
+    const pastedCount = () => fs.readdirSync(remoteRoot).filter((name) => name.startsWith("pasted-")).length;
+    const before = pastedCount();
+    const inputBefore = server.received().length;
+    await evaluate(session, `
+      document.querySelector("#terminals > div:not(.hidden)")
+        .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      return true;
+    `);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(pastedCount(), before, "a right-click must not upload the clipboard image");
+    assert.equal(server.received().slice(inputBefore), "", "and must send nothing to the shell");
+    assert.match(await evaluate(session, `return document.getElementById("file-message").textContent;`), /Right-click pastes text only/, "the status line says why nothing happened");
+
+    for (const type of ["rawKeyDown", "keyUp"]) {
+      await session.send("Input.dispatchKeyEvent",
+        { type, modifiers: 8, key: "Insert", code: "Insert", windowsVirtualKeyCode: 45 });
+    }
+    await waitFor(session, `document.getElementById("file-message").textContent.startsWith("Pasted pasted-")`,
+      "Shift+Insert to upload the image");
+    assert.equal(pastedCount(), before + 1, "Shift+Insert still uploads it");
+    holder.kill("SIGKILL");
+    console.log("• a right-click leaves a clipboard screenshot alone; Shift+Insert still uploads it");
+  }
 
   // A paste carrying a real local path uploads by path instead of by bytes.
   const pastedPath = path.join(userData, "pasted by path.txt");

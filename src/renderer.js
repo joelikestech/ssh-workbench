@@ -35,6 +35,10 @@ const workbench = {
   clipboardLimit: 200_000,
 };
 
+// How far, in pixels, a middle press has to move before it is a drag rather than a
+// click. A wheel is clicked with some force, and the pointer moves a little with it.
+const MIDDLE_DRAG_DISTANCE = 4;
+
 const TERMINAL_OPTIONS = {
   cursorBlink: true,
   fontSize: 14,
@@ -226,10 +230,18 @@ function pasteText(session, text) {
   if (clean) session.terminal.paste(clean);
 }
 
-function pasteFromClipboard(session) {
+// A right-click pastes text and nothing else. It is a reflex, and a screenshot is
+// one of the commonest things on a clipboard, so a stray one must not write a file
+// into whatever folder the pane happens to show. The paste keys still send an image
+// to the folder; they are pressed on purpose.
+function pasteFromClipboard(session, { textOnly = false } = {}) {
   readClipboard().then((text) => {
     if (text) {
       pasteText(session, text);
+      return;
+    }
+    if (textOnly) {
+      setMessage(session, "Right-click pastes text only, and the clipboard holds none. To upload a screenshot or files, paste them with Ctrl+V.", "");
       return;
     }
     // Nothing a shell can use, so an image on the clipboard goes to the folder.
@@ -276,18 +288,24 @@ function createTerminal(session) {
   // mouse selection can then be copied with Enter or the right button.
   let dragFromHost = false;
   let dragWithShift = false;
+  let dragWithMiddle = false;
+  // A middle press held back until it is known to be a drag or a click, and whether
+  // it has turned into a drag.
+  let middlePress = null;
+  let middleDragging = false;
   // A drag the remote program owns: where it was pressed, and where the pointer is.
   let grabbedPress = null;
   let pointer = null;
-  const synthetic = (type, at, { shiftKey = false, buttons = 1 } = {}) => {
+  const synthetic = (type, at, { shiftKey = false, altKey = false, button = 0, buttons = 1 } = {}) => {
     const event = new MouseEvent(type, {
       bubbles: true,
       cancelable: true,
       view: window,
-      button: 0,
+      button,
       buttons,
       detail: 1,
       shiftKey,
+      altKey,
       clientX: at.clientX,
       clientY: at.clientY,
       screenX: at.screenX,
@@ -300,9 +318,27 @@ function createTerminal(session) {
   // cancels these events, and a bubble-phase listener would never run — which is
   // exactly the case where Shift+drag matters most.
   host.addEventListener("mousedown", (event) => {
-    if (event.button !== 0) return;
     // The press this handler raised again below; its drag is already being followed.
     if (event.workbenchRestarted) return;
+    // A middle-button drag selects and copies, as Shift+drag does. The press is held
+    // back -- from a remote program, Chromium's autoscroll and a Linux primary paste
+    // -- until the pointer has either moved far enough to be a drag or come back up
+    // as a click. A click is then handed to the program after all (see finishDrag),
+    // so only a middle drag is ever kept from it.
+    if (event.button === 1) {
+      event.preventDefault();
+      event.stopPropagation();
+      dragFromHost = true;
+      dragWithShift = true;
+      dragWithMiddle = true;
+      grabbedPress = null;
+      pointer = null;
+      middleDragging = false;
+      middlePress = { target: event.target, altKey: event.altKey, clientX: event.clientX, clientY: event.clientY, screenX: event.screenX, screenY: event.screenY };
+      session.columnSelection = event.altKey;
+      return;
+    }
+    if (event.button !== 0) return;
     dragFromHost = true;
     dragWithShift = event.shiftKey;
     // xterm makes an Alt+drag a column selection, and a double or triple click a
@@ -356,6 +392,19 @@ function createTerminal(session) {
     if (grabbedPress && !event.workbenchRestarted) {
       pointer = { clientX: event.clientX, clientY: event.clientY, screenX: event.screenX, screenY: event.screenY };
     }
+    // A held middle press that has moved far enough is a drag. xterm only selects
+    // with the primary button, so a primary press is raised where the middle one
+    // landed; where a program holds the mouse it carries Shift, which makes xterm
+    // select locally rather than report it. The drag itself has only the middle
+    // button down, which xterm's drag reporting ignores, so the program sees none of it.
+    if (middlePress && !middleDragging && !event.workbenchRestarted
+      && Math.hypot(event.clientX - middlePress.clientX, event.clientY - middlePress.clientY) > MIDDLE_DRAG_DISTANCE) {
+      middleDragging = true;
+      const grabbed = session.terminal.modes?.mouseTrackingMode !== "none";
+      const target = middlePress.target.isConnected ? middlePress.target : session.terminal.element;
+      target.dispatchEvent(synthetic("mousedown", middlePress, { shiftKey: grabbed, altKey: middlePress.altKey }));
+      document.dispatchEvent(synthetic("mousemove", event, { shiftKey: grabbed, altKey: middlePress.altKey }));
+    }
   };
   const takeDragBack = (event) => {
     if (event.key !== "Shift" || !dragFromHost || !grabbedPress) return;
@@ -375,7 +424,31 @@ function createTerminal(session) {
     if (event.workbenchRestarted) return;
     grabbedPress = null;
     if (!dragFromHost) return;
+    const middle = dragWithMiddle;
+    // A middle drag ends only when the middle button comes up.
+    if (middle && event.button !== 1) return;
     dragFromHost = false;
+    dragWithMiddle = false;
+    if (middle) {
+      const press = middlePress;
+      middlePress = null;
+      if (!middleDragging) {
+        // A middle click, not a drag. A program holding the mouse is given the press
+        // it was kept from, where it landed; this release then follows it to xterm
+        // and is reported as the button coming up. A click is a click to the program,
+        // however late its press arrives. Anywhere else nothing happens here, and on
+        // Linux the release pastes the primary selection as it always has.
+        if (session.terminal.modes?.mouseTrackingMode !== "none") {
+          const target = press.target.isConnected ? press.target : session.terminal.element;
+          target.dispatchEvent(synthetic("mousedown", press, { button: 1, buttons: 4, altKey: press.altKey }));
+        }
+        return;
+      }
+      middleDragging = false;
+    }
+    // On Linux the middle button's release pastes the primary selection, which xterm
+    // has just filled with the dragged text. After a middle drag it is a copy only.
+    if (middle) event.preventDefault();
     const withShift = dragWithShift || event.shiftKey;
     // The final pointer position reaches the selection after this event.
     setTimeout(() => {
@@ -407,7 +480,7 @@ function createTerminal(session) {
     event.preventDefault();
     // Copy an existing selection, otherwise paste, exactly as the Windows
     // console does with QuickEdit enabled.
-    if (!copySelection(session)) pasteFromClipboard(session);
+    if (!copySelection(session)) pasteFromClipboard(session, { textOnly: true });
   }, true);
 
   session.host = host;
@@ -2800,10 +2873,11 @@ const HELP_SECTIONS = [
   ["Terminal · selecting and copying", [
     ["Drag", "Select text. Nothing is copied yet."],
     ["Shift+drag", "Select and copy immediately. Shift also forces a local selection while a remote program such as Claude Code, vim, tmux, or less is using the mouse, even when pressed after the drag has started."],
+    ["Middle-drag", "Drag with the scroll wheel held down: select and copy, as Shift+drag does, including while a remote program is using the mouse."],
     ["Double-click", "Select a word."],
     ["Triple-click", "Select a whole line."],
     ["Enter", "Copy and clear a selection made with the mouse, as the Windows console does. With no such selection it is an ordinary Enter."],
-    ["Right-click", "Copy the selection; paste when nothing is selected."],
+    ["Right-click", "Copy the selection; paste text when nothing is selected. A screenshot or copied files are never uploaded from a right-click: paste those with Ctrl+V."],
     ["Ctrl+C", "Copy the selection with its common leading indentation removed, so pasted commands run. Sends SIGINT when nothing is selected."],
     ["Ctrl+Shift+C", "Copy the selection exactly, indentation included."],
     ["Ctrl+Insert", "Copy the selection with its common leading indentation removed, as Ctrl+C does."],

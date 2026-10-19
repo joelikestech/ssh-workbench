@@ -20,8 +20,8 @@ The interface combines:
 - Tabbed sessions in as many windows as you want: up to eight connections per
   window, each with its own terminal, remote folder, selection, and search.
 - An xterm.js terminal backed by a real SSH pseudo-terminal, with Windows-console
-  copy and paste: Shift+drag copies, right-click copies or pastes, `Enter`
-  finishes a mouse selection.
+  copy and paste: Shift+drag or a middle-button drag copies, right-click copies
+  or pastes text, `Enter` finishes a mouse selection.
 - An SFTP file explorer with name, path, and wildcard search across the tree,
   which falls back to `scp` and `ls` on hosts with no SFTP subsystem.
 - Multi-file and recursive folder upload/download.
@@ -151,9 +151,10 @@ and mouse action, including the file pane and drag-and-drop ones.
 | --- | --- |
 | Drag | Select text; the clipboard is left alone |
 | `Shift`+drag | Select **and copy**, including while a remote program holds the mouse |
+| Middle-drag (scroll wheel held) | Select **and copy**, as `Shift`+drag does |
 | Double-click / triple-click | Select a word / a line |
 | `Enter` after a mouse selection | Copy and clear it, instead of reaching the shell |
-| Right-click | Copy the selection; paste when nothing is selected |
+| Right-click | Copy the selection; paste text when nothing is selected (never uploads a screenshot or files) |
 | `Ctrl+C` | Copy the selection, or send SIGINT when there is none |
 | `Ctrl+Insert` | Copy the selection |
 | `Ctrl+Shift+C` | Copy the selection exactly as it is on screen |
@@ -455,6 +456,12 @@ Focus does not matter, because the clipboard decides. Only *text* is ambiguous â
 the shell has a use for it â€” so text pasted while the terminal has focus goes to
 the shell as always. An image or a file has one possible destination, and it goes
 there whether the terminal or the file pane has focus.
+
+Right-clicking the terminal is the exception: it pastes text and nothing else. A
+right-click is a reflex, and a screenshot is one of the commonest things on a
+clipboard, so a stray one never writes a file into whatever folder happens to be
+shown. With no text on the clipboard it does nothing, and the status line says to
+use `Ctrl+V`.
 
 Names are generated from the local clock and checked against the folder, so a
 second paste in the same second never overwrites the first. Pasted images are
